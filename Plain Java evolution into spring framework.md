@@ -2023,14 +2023,14 @@ To share a connection, you’d need to:
 ```mermaid
 graph TD
     A[Start: java App] --> B[Load App.class]
-    B --> C[Call main()]
-    C --> D[new RegistrationService()]
+    B --> C["Call main()"]
+    C --> D["new RegistrationService()"]
     D --> E[Load RegistrationService.class]
-    E --> F[new EmailService()] --> G[Load EmailService.class]
-    E --> H[new UserRepository()] --> I[Load UserRepository.class]
-    D --> J[Call register()]
-    J --> K[Call userRepository.save()]
-    J --> L[Call emailService.sendWelcomeEmail()]
+    E --> F["new EmailService()"] --> G[Load EmailService.class]
+    E --> H["new UserRepository()"] --> I[Load UserRepository.class]
+    D --> J["Call register()"]
+    J --> K["Call userRepository.save()"]
+    J --> L["Call emailService.sendWelcomeEmail()"]
     K --> M[Print 'Saving user...']
     L --> N[Print 'Sending email...']
 ```
