@@ -1,4 +1,4 @@
-```
+
 You’re asking two deep questions:
 
 1. **What comes after Spring Boot in the AI era?**
@@ -305,8 +305,7 @@ Just like:
 > the next wave removes **boilerplate thinking**.
 
 
-
-```
+-----------------
 
 
 I'll analyze this document about the evolution beyond Spring Boot in the AI era.
