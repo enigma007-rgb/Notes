@@ -522,7 +522,7 @@ Cost Saved = Time Saved × (Hourly cost of human)
 Risk Reduced = (Incidents prevented) × (Cost per incident)
 
 Total ROI = Cost Saved + Risk Reduced - Development Cost
-
+```
 
 ---------
 
