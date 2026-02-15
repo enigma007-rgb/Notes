@@ -643,7 +643,7 @@ Insight: Enterprise features build moats, AI is feature parity race
 
 **4:00 PM - Journal Entry & Synthesize (30 minutes)**
 
-```markdown
+```
 # Day 1: Enterprise vs AI Decision
 
 ## Time Spent: 6 hours
