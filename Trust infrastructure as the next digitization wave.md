@@ -1,12 +1,12 @@
-```
+--------
+
 2010's era - Cloud Infrastructure - democratize compute and storage.   
 
 2025's era - AI Infrastructure - democratize AI/intelligence  
 
 2030s era - Trust Infrastructure—the "next digitization wave"—which renders global value networks paper-less, document-less, contact-less, cash-less, and presence-less and border-less, indispensable layer of verified credibility solving scarcity of Trust anchored through digital sovereignty. Trust networks enable value networks as such risks around (identity, money, assets, entities) could be managed and mitigated through institutions, programmable-x, unified-ledgers, protocols/standards with agents/consumer-wallets and business-wallets acting as control point.
 
-```
-
+-------
 
 This is a compelling thesis. Let me stress-test and enrich it.
 
