@@ -1,3 +1,569 @@
+Let me be upfront about something important before we go further.
+
+---
+
+## The Honest Assessment First
+
+SailPoint IdentityIQ is enterprise identity governance software. It is:
+
+**Closed source** — the internal implementation is not publicly available. Training data about its internals is sparse.
+
+**Enterprise proprietary** — most production troubleshooting knowledge lives in: internal customer support tickets, private Compass community posts behind login walls, internal SailPoint consultant knowledge, enterprise customer Slack channels and Teams conversations. Almost none of this is publicly indexed.
+
+**Version-sensitive** — behavior differences between 8.1, 8.2, 8.3, 8.4 are significant and sparsely documented publicly.
+
+**Configuration-dependent** — IIQ behavior is heavily driven by your specific connectors, rules, workflows, and customizations. Generic answers are particularly dangerous here.
+
+This means the hallucination risk map from the previous response applies strongly here:
+
+The LLM has good knowledge of: IIQ concepts, general architecture, publicly documented features, common integration patterns documented in public blogs and the Compass community.
+
+The LLM has moderate knowledge of: common troubleshooting patterns, known issues documented in public forums, general connector behavior.
+
+The LLM has high hallucination risk for: specific version behaviors, internal rule execution details, specific connector edge cases, your customization interactions, anything that requires reading SailPoint source code.
+
+---
+
+## Why DERIVE Still Helps Despite These Limitations
+
+Even with high hallucination risk, DERIVE provides three genuine values for IIQ troubleshooting:
+
+**Value 1 — Structured diagnostic reasoning**
+DERIVE forces you to organize your evidence before asking questions. The act of constructing a DERIVE prompt often surfaces the answer yourself. You realize mid-prompt that you haven't checked something obvious.
+
+**Value 2 — Pattern matching against public knowledge**
+IIQ troubleshooting patterns that appear in public Compass posts, blogs, and community discussions are in the training data. DERIVE reaches this knowledge better than generic prompts.
+
+**Value 3 — Elimination framework**
+Even when the LLM cannot give you the exact answer, it can help you eliminate possibilities systematically and identify what to investigate next. This is diagnostic scaffolding, not diagnostic certainty.
+
+---
+
+## The Modified DERIVE for IIQ Troubleshooting
+
+Because of IIQ's proprietary nature, the V principle (Verify) becomes mandatory at every step, not optional. The framework becomes:
+
+**D — Describe the exact failure with evidence**
+**E — Eliminate what you have already ruled out**
+**R — Request pattern-matching against known IIQ failure modes**
+**I — Insist on diagnostic chain before conclusion**
+**V — Verify every specific claim against SailPoint Compass or logs before acting**
+**E — Expand one hypothesis at a time**
+
+---
+
+## Scenario 1: Aggregation Failing for a Specific Application
+
+### The Setup
+
+You have an IIQ environment. An aggregation job for a specific application connector is failing. Some accounts aggregate successfully. Some fail silently. Some fail with errors. Users are calling the help desk saying their access review shows missing accounts.
+
+---
+
+### Round 1 — D (Describe the Exact Failure With Evidence)
+
+**Generic prompt:**
+"My SailPoint IIQ aggregation is failing. How do I fix it?"
+
+**Generic response:**
+```
+Check connector configuration.
+Review application logs.
+Verify network connectivity.
+Check account schema.
+Review aggregation task settings.
+```
+
+This is the IIQ equivalent of "have you tried turning it off and on again." Useless.
+
+**DERIVE Round 1:**
+
+"I am troubleshooting an aggregation failure in SailPoint IdentityIQ 8.3. The application is an Active Directory connector aggregating from a specific OU. The aggregation task is scheduled to run nightly at 2am.
+
+Observed behavior:
+- Task starts and shows status RUNNING
+- Task runs for approximately 45 minutes (normal runtime is 15 minutes)
+- Task completes with status SUCCESS — no error shown in task results
+- When I check the aggregation statistics in the task result, it shows: Accounts Scanned: 4,847, Accounts Created: 0, Accounts Updated: 12, Accounts Deleted: 0
+- Last week the same task showed: Accounts Scanned: 5,203, Accounts Created: 8, Accounts Updated: 156, Accounts Deleted: 3
+- I have verified in Active Directory that there are 5,203 accounts in the target OU
+- The 356 missing accounts (5,203 - 4,847) are all in a specific sub-OU that was migrated from a different domain 2 weeks ago
+
+Do NOT tell me to check connector configuration generally — I need to know specifically what about this sub-OU migration could cause accounts to be silently skipped without error. Do NOT suggest this is a permissions issue generally — the service account has identical permissions in both the old and new sub-OU.
+
+Before recommending any fix: walk through every mechanism by which IIQ AD aggregation can silently skip accounts without logging an error. Specifically: what happens when IIQ encounters an account it cannot fully read mid-aggregation? Does it skip and continue or fail the whole task?"
+
+**What DERIVE extracts:**
+
+The model is forced to reason about silent skip mechanisms specifically:
+
+**Silent skip mechanism 1 — Schema attribute read failures:**
+
+When IIQ aggregates an AD account, it attempts to read every attribute defined in the application schema. If a specific account has an attribute value that cannot be serialized — binary data in an unexpected attribute, a value that exceeds configured length limits, a null value in an attribute marked required in the schema — IIQ may log a warning in the application server log (not the task result) and skip the account. The task result shows SUCCESS because the task itself succeeded. The skipped accounts simply never appear in the statistics.
+
+The migration from a different domain is the key signal. Domain migrations often leave accounts with:
+- SIDHistory attributes containing values from the old domain
+- ObjectGUID values that IIQ has cached from the old domain mapping
+- Custom attributes populated in the old domain that are empty or different format in the new domain
+- Group memberships that reference groups in the old domain that no longer resolve
+
+**Silent skip mechanism 2 — ObjectGUID collision:**
+
+If IIQ uses ObjectGUID as the native identity (common AD connector configuration), and the migrated accounts have the same sAMAccountName as accounts IIQ previously knew about (even deleted ones), IIQ may be confused about whether to create, update, or skip these accounts. The correlation logic finds no match by ObjectGUID (new domain, new GUID), tries to create, finds a correlation match by sAMAccountName to a deleted account, enters an ambiguous state, and skips.
+
+**Where to look in logs:**
+
+```
+# This is NOT in the IIQ UI task results
+# Look in: <IIQ_HOME>/logs/sailpoint.log
+
+grep -i "skip\|exception\|error\|warn" sailpoint.log | grep -i "aggregat" | \
+  grep "2024-01-15 02:" > aggregation_errors.txt
+
+# Specific patterns to look for:
+# "Skipping account" - explicit skip with reason
+# "Failed to read attribute" - attribute read failure
+# "Duplicate identity" - correlation collision
+# "Unable to correlate" - correlation failure that may cause skip
+```
+
+---
+
+### Round 2 — E + R (Eliminate and Reach Long Tail)
+
+**DERIVE Round 2:**
+
+"Your Round 1 response identified two mechanisms: attribute read failures and ObjectGUID collision. I checked the sailpoint.log file during the aggregation window.
+
+I found these log entries repeating for the 356 missing accounts:
+```
+WARN  Aggregator - Failed to process ResourceObject for account: 
+      CN=John Smith,OU=MigratedUsers,DC=company,DC=com
+      Error: com.sailpoint.connector.ConnectorException: 
+      Attribute 'msDS-cloudExtensionAttribute10' value exceeds maximum length
+```
+
+I also found:
+```
+WARN  SailPointContext - Cannot find object of class sailpoint.object.ManagedAttribute 
+      for value: S-1-5-21-OLD-DOMAIN-SID-XXXX in attribute memberOf
+```
+
+Both errors appear for all 356 missing accounts. The accounts were skipped because of these errors.
+
+Do NOT tell me to check schema configuration generally. Tell me specifically:
+1. What the 'value exceeds maximum length' error means in IIQ schema context and where the length limit is configured
+2. What the 'Cannot find ManagedAttribute' error for old SID values means for aggregation behavior
+3. Which error is causing the skip — both, or is one the primary cause
+
+You are a SailPoint IIQ consultant who has seen AD domain migration aggregation failures specifically. Walk through which of these two errors would cause a skip versus which would cause a warning but continue processing."
+
+**What DERIVE extracts with the evidence:**
+
+Now the model has real log evidence to work with. This is where DERIVE's E (evidence) principle pays off most:
+
+**Error 1 analysis — Attribute length:**
+
+The `msDS-cloudExtensionAttribute10` error is an IIQ schema configuration issue, not an AD issue. IIQ schema definitions for application attributes have a `maxLength` property. If the AD attribute contains a value longer than what the IIQ schema allows, IIQ throws this exception. In the AD connector, this typically causes the entire ResourceObject processing to fail for that account — meaning the account is skipped entirely, not just the specific attribute.
+
+Where the length limit is configured:
+```
+IIQ UI → Applications → [Your AD Application] → 
+Account Schema → Find attribute 'msDS-cloudExtensionAttribute10' → 
+Check 'Max Length' field
+
+OR in the application XML:
+<AttributeDefinition name="msDS-cloudExtensionAttribute10" 
+                     type="string" 
+                     maxLength="255">  <!-- This is the limit -->
+```
+
+The migrated accounts likely have longer values in this attribute because they came from a different domain where the attribute was used differently.
+
+**Error 2 analysis — Old SID in memberOf:**
+
+The `Cannot find ManagedAttribute` warning for old domain SIDs is a different type of error. IIQ is trying to resolve group memberships (memberOf attribute) and cannot find the group definition in its ManagedAttribute table because the group SID from the old domain no longer exists in IIQ's catalog. This is a warning, not a fatal error — IIQ typically continues processing the account and simply omits the unresolvable group membership.
+
+**Which error causes the skip:**
+
+Error 1 (maxLength) is the primary cause of the skip. It throws a ConnectorException during ResourceObject processing which terminates processing of that account. Error 2 (old SID) is a warning that would not by itself cause a skip — but because Error 1 terminates processing first, you see both errors for the same accounts.
+
+**Immediate diagnostic test:**
+
+Find one of the 356 missing accounts in AD. Check the actual length of `msDS-cloudExtensionAttribute10` for that account:
+
+```powershell
+Get-ADUser -Identity "john.smith" -Properties msDS-cloudExtensionAttribute10 | 
+  Select-Object @{N='AttrLength';E={$_.msDS-cloudExtensionAttribute10.Length}},
+               msDS-cloudExtensionAttribute10
+```
+
+If the value is longer than your IIQ schema's maxLength setting, you have confirmed the root cause.
+
+---
+
+### Round 3 — I (Insert Reasoning Before Fix)
+
+**DERIVE Round 3:**
+
+"The diagnostic test confirmed: all 356 missing accounts have msDS-cloudExtensionAttribute10 values between 280-340 characters. The IIQ schema has maxLength set to 255.
+
+Before recommending a fix:
+
+Step 1: Walk through the implications of simply increasing maxLength to 500 in the IIQ schema. What else does maxLength affect — is it purely validation or does it affect database storage?
+
+Step 2: Walk through the alternative of excluding this attribute from the schema entirely. What would we lose?
+
+Step 3: Walk through whether there is an IIQ rule-based approach to truncate or transform the value during aggregation instead of changing the schema.
+
+Step 4: Walk through what happens to the 356 accounts that have been missing from IIQ for 2 weeks — when they successfully aggregate after the fix, will IIQ treat them as new accounts or will it find existing identities? What is the risk of duplicate identity creation?
+
+Only after all four — give me the recommended fix sequence."
+
+**What Round 3 extracts:**
+
+**Step 1 — maxLength implications:**
+
+In IIQ, maxLength on a schema attribute affects two things: validation during aggregation (what you are hitting) and the database column size in the IdentityIQ database. The `spt_link_attribute` table stores account attribute values. If the IIQ database column was created with a specific size constraint, increasing maxLength in the schema without a corresponding database migration may cause a different error — a database truncation or overflow error — when IIQ tries to persist the longer value.
+
+**Critical verification before proceeding:**
+
+```sql
+-- Check the actual column definition in your IIQ database
+-- (PostgreSQL example)
+SELECT column_name, data_type, character_maximum_length
+FROM information_schema.columns
+WHERE table_name = 'spt_link_attribute' 
+  AND column_name LIKE '%value%';
+
+-- If column is VARCHAR(255), increasing schema maxLength to 500
+-- without altering the column will move your error from aggregation
+-- to database persistence — a different error, not a fix
+```
+
+**Step 2 — Excluding the attribute:**
+
+Excluding `msDS-cloudExtensionAttribute10` from the schema means IIQ stops reading and storing this attribute entirely. Implications: any access certification, role mining, or policy that references this attribute stops working. Any report that includes this attribute returns null. Before excluding, search your IIQ configuration:
+
+```
+IIQ UI → Debug → Search for 'msDS-cloudExtensionAttribute10' 
+across: Roles, Policies, Certifications, Reports, Rules, Workflows
+```
+
+If no results: safe to exclude. If results: excluding breaks those configurations.
+
+**Step 3 — Rule-based transformation:**
+
+IIQ supports a Customization Rule on application connectors that runs during aggregation and can modify the ResourceObject before IIQ processes it. This is the cleanest fix — transform the attribute value during ingestion without changing schema or losing data:
+
+```java
+// Customization Rule in IIQ (Beanshell)
+// Applied to AD application: Application → Aggregation → Customization Rule
+
+import sailpoint.object.ResourceObject;
+import org.apache.log4j.Logger;
+
+Logger log = Logger.getLogger("com.company.rules.ADCustomization");
+
+String attrName = "msDS-cloudExtensionAttribute10";
+String value = (String) object.getAttribute(attrName);
+
+if (value != null && value.length() > 255) {
+    log.warn("Truncating " + attrName + " for account: " + 
+             object.getIdentity() + " from length " + value.length());
+    object.setAttribute(attrName, value.substring(0, 255));
+}
+
+return object;
+```
+
+**Step 4 — The 356 missing accounts risk:**
+
+This is the most important step and the one most teams miss. The 356 accounts have been missing from IIQ for 2 weeks. During this time:
+
+If IIQ uses sAMAccountName for correlation: when these accounts successfully aggregate, IIQ finds existing identities with matching sAMAccountNames and updates them. Safe — no duplicates.
+
+If IIQ uses ObjectGUID for native identity AND sAMAccountName for correlation: IIQ creates a new Link object (because ObjectGUID from new domain doesn't match old domain GUID), then finds an existing identity via sAMAccountName correlation, and attaches the new link to the existing identity. This may create a duplicate link on the identity — old domain link (now stale) and new domain link. The old link may trigger false "orphaned account" certifications.
+
+**Before running the fix aggregation:**
+
+```
+IIQ UI → Debug → Object Browser → Identity → 
+Search for one of the 356 affected users →
+Check: how many Links exist for this identity?
+Check: what is the nativeIdentity value of the AD link?
+Does it match the current ObjectGUID in the new domain?
+```
+
+---
+
+### Round 4 — V (Verify Before Acting)
+
+**DERIVE Round 4:**
+
+"Before I implement the Customization Rule fix:
+
+1. What is your confidence level on the Customization Rule approach for the attribute truncation? Is this documented IIQ behavior or are you reasoning from general IIQ architecture?
+
+2. What specifically should I test in a non-production IIQ environment before running this in production?
+
+3. What is the rollback plan if the Customization Rule causes unexpected behavior?
+
+4. What monitoring should I have in place during the first post-fix aggregation run?"
+
+**What Round 4 extracts:**
+
+**Confidence assessment (model should flag):**
+
+The Customization Rule mechanism for modifying ResourceObjects during aggregation is documented IIQ behavior — Compass documentation covers this. Moderate-high confidence.
+
+The specific Beanshell syntax should be verified against your IIQ version's Beanshell API documentation on Compass before use. Low-medium confidence on exact syntax — test in non-production first.
+
+The database column size warning is based on general knowledge of how IIQ stores attribute data — this should be verified by actually checking your database schema. High priority to verify before proceeding.
+
+**The specific non-production test:**
+
+```
+Step 1: Apply Customization Rule in non-production IIQ
+Step 2: Run aggregation against a test OU containing 5 of the 356 problem accounts
+Step 3: Verify in sailpoint.log: no 'value exceeds maximum length' errors
+Step 4: Verify in IIQ UI: all 5 accounts appear in application account list
+Step 5: Verify identity correlation: no duplicate links created
+Step 6: Verify truncated attribute value stored correctly on the Link object
+Step 7: Check database: spt_link_attribute table for these 5 accounts - 
+        value stored without database error
+```
+
+**Rollback plan:**
+
+```
+If Customization Rule causes unexpected behavior:
+1. Remove rule from application (Application → Aggregation → Customization Rule → clear)
+2. System returns to previous state immediately — no data migration needed
+3. Rule removal takes effect on next aggregation run
+4. Previous behavior (skip with error) resumes
+```
+
+**Monitoring during first production fix run:**
+
+```bash
+# Terminal 1: Watch sailpoint.log in real-time during aggregation
+tail -f <IIQ_HOME>/logs/sailpoint.log | grep -E "ERROR|WARN|Skipping|truncat"
+
+# Terminal 2: Watch aggregation statistics
+# IIQ UI → Tasks → [Aggregation Task] → refresh every 2 minutes
+# Watch: Accounts Scanned counter — should climb to 5,203 not stop at 4,847
+
+# After completion:
+# Check task result statistics:
+# Accounts Scanned should be 5,203
+# Accounts Created: expect ~0 (if correlation finds existing identities)
+# Accounts Updated: expect ~356 (existing identities updated with new link)
+# If Accounts Created shows ~356: correlation not working — investigate before certifications run
+```
+
+---
+
+## Scenario 2: Provisioning Workflow Stuck in Pending State
+
+### Full DERIVE Prompt (All Principles Applied Together):
+
+"I am troubleshooting a provisioning issue in SailPoint IIQ 8.2. We have a joiner workflow that provisions access for new employees. The workflow: triggers on identity create event → runs approval → provisions to 5 applications → sends welcome email.
+
+Observed behavior:
+- Workflow triggers correctly for new employee hires
+- Approval step completes — approvers receive and approve work items
+- After approval, workflow shows status: Pending in the IIQ UI
+- The 5 provisioning requests show status: Queued
+- They have been in Queued state for 6 hours — normally provisioning completes in 10 minutes
+- No error shown in workflow UI
+- This started happening 3 days ago — worked fine before that
+- 3 days ago we deployed a new version of a custom connector for one of the 5 applications
+- The other 4 applications provision successfully when we test them individually
+
+Do NOT tell me to check workflow configuration generally — the workflow worked before. Do NOT tell me to check provisioning configuration generally — 4 of 5 applications work.
+
+You are a SailPoint IIQ integration engineer who has debugged stuck provisioning queues specifically. You know the difference between a provisioning request that is stuck because of a connector error versus one that is stuck because the provisioning engine itself is blocked.
+
+Step 1: Walk through the specific mechanism by which a single failing connector can cause provisioning requests for other connectors to also queue indefinitely.
+
+Step 2: Walk through what the Queued state means technically — is the request waiting for a thread, waiting for a connector response, waiting for a retry timer?
+
+Step 3: Walk through where in IIQ logs I find the actual error for a provisioning request that shows no error in the UI.
+
+Step 4: Give me the diagnostic sequence before any fix."
+
+**What DERIVE extracts:**
+
+**Step 1 — How one connector blocks others:**
+
+IIQ's provisioning engine uses a thread pool for connector provisioning operations. By default, IIQ has a limited number of provisioning threads. If the new custom connector is hanging — making an outbound connection that never times out, waiting for a response that never comes — those threads are held indefinitely.
+
+With a small thread pool (IIQ default is often 5-10 provisioning threads) and a hanging connector consuming threads, new provisioning requests for all connectors queue waiting for a free thread. This is why your 4 working applications are also stuck — not because they have errors, but because there are no threads available to execute them.
+
+The specific mechanism: hanging connector call → thread held → thread pool exhausted → all provisioning requests queue → no apparent error because each request is technically "waiting for execution" not "failed."
+
+**Step 2 — What Queued state means technically:**
+
+In IIQ, a provisioning request in Queued state is waiting to be picked up by the PersistentRequestHandler — a background service that dequeues and executes provisioning operations. The request is persisted in the `spt_provisioning_transaction` table with status=Queued.
+
+The PersistentRequestHandler polls this table and executes requests using threads from the provisioning thread pool. If threads are held by hanging operations, the handler picks up the request, attempts to assign it a thread, finds none available, and puts it back in Queued state.
+
+This means: Queued for 6 hours with no error = thread pool exhaustion, not connector configuration error.
+
+**Step 3 — Where the actual error lives:**
+
+```bash
+# The UI shows no error because the thread is hung, not errored
+# The actual evidence is in:
+
+# 1. sailpoint.log - look for the custom connector's operations
+grep -i "customconnector\|[connector_class_name]" sailpoint.log | \
+  tail -100
+
+# 2. Thread dump - shows hung threads explicitly
+# Take a thread dump of the IIQ application server JVM:
+# If Tomcat: 
+kill -3 [tomcat_pid]  # Thread dump goes to catalina.out
+
+# OR via JVM tools:
+jstack [pid] > threaddump_$(date +%Y%m%d_%H%M%S).txt
+
+# In the thread dump, look for threads blocked in your connector code:
+grep -A 20 "BLOCKED\|WAITING" threaddump.txt | \
+  grep -A 20 "customconnector\|[your connector package]"
+
+# 3. Check active provisioning transactions in database:
+SELECT id, identity_name, plan, status, created, modified
+FROM spt_provisioning_transaction  
+WHERE status = 'Queued'
+ORDER BY created ASC;
+-- If rows have old created timestamps but recent modified: 
+-- they are being picked up and re-queued repeatedly
+-- confirming thread pool exhaustion
+```
+
+**Step 4 — Diagnostic sequence:**
+
+```
+Step 1: Take a thread dump immediately
+        Look for: threads blocked in custom connector code
+        Confirms: thread pool exhaustion hypothesis
+
+Step 2: Check custom connector operation in isolation
+        IIQ UI → Applications → [Custom Connector App] → 
+        Test Connection
+        If test hangs: connector has a connection/timeout issue
+        If test succeeds: issue may be specific to provisioning operation
+
+Step 3: Check connector timeout configuration
+        Custom connectors should have explicit connection and read timeouts
+        Without timeouts, a dropped connection hangs the thread indefinitely
+        Check connector source code or configuration for timeout settings
+
+Step 4: Temporarily disable the custom connector application from the workflow
+        Test if provisioning for the other 4 applications proceeds
+        If yes: confirms the custom connector is blocking the thread pool
+        This is a safe diagnostic — does not affect production users
+        just confirms the hypothesis before you touch the connector
+
+Step 5: If thread pool exhaustion confirmed:
+        Restart the IIQ application server (releases hung threads)
+        Immediately disable or fix the custom connector
+        Re-run provisioning for stuck identities
+```
+
+---
+
+## Scenario 3: Access Certification Campaign Showing Wrong Entitlements
+
+### Full DERIVE Prompt:
+
+"I am troubleshooting an access certification issue in SailPoint IIQ 8.3. We ran a manager certification campaign. Certifiers are reporting that some direct reports show entitlements that the employee does not actually have in the source system.
+
+Specific observations:
+- Employee John Smith shows entitlement 'Finance-ReadOnly' on the Certification
+- I checked John's account in the actual AD application: this group is NOT in his memberOf attribute
+- The entitlement appears as 'Active' on his certification item
+- John's last aggregation was 18 hours ago
+- The entitlement 'Finance-ReadOnly' appears in IIQ's Link object for John under the AD application
+- In the entitlement catalog, Finance-ReadOnly shows last aggregation 3 days ago
+
+Do NOT tell me to re-aggregate. I need to understand the mechanism first.
+
+You are a SailPoint IIQ consultant who has debugged phantom entitlements in certifications. You know the specific IIQ data model relationship between: the Link object, the entitlement catalog, the certification item, and the source system. Walk through the exact data flow that produces a certification item showing an entitlement that no longer exists in the source system. Then tell me which specific IIQ table or object contains the stale data."
+
+**What DERIVE extracts:**
+
+**The exact data flow producing phantom entitlements:**
+
+IIQ maintains entitlement data in two separate places that can get out of sync:
+
+**The Link object** — stored in `spt_link` and `spt_link_attribute` tables. This represents what IIQ saw during the last aggregation of that specific account. John's last aggregation was 18 hours ago. At that time, Finance-ReadOnly WAS in his memberOf. He was subsequently removed from the group in AD. IIQ does not know this yet — the Link still reflects the state from 18 hours ago.
+
+**The entitlement catalog** — stored in `spt_managed_attribute` table. This is a separate catalog of known entitlements, aggregated from the application independently of individual account aggregations.
+
+**The certification item** — generated from a snapshot of the Link object at the time the certification was launched. If the certification was launched AFTER John's last aggregation but BEFORE the next aggregation that would have removed Finance-ReadOnly, the certification snapshot captured the stale Link data.
+
+**The critical insight:** re-aggregation of John's account will update his Link object. But if the certification was already generated from the snapshot, the certification item still shows Finance-ReadOnly even after re-aggregation. The certification and the live data are now permanently out of sync until the certification is closed and a new one generated.
+
+**Which object contains the stale data:**
+
+```sql
+-- The certification item snapshot:
+SELECT ci.id, ci.identity_name, ci.application, ci.attribute, ci.value, 
+       ci.action, ci.status
+FROM spt_certification_item ci
+JOIN spt_certification c ON ci.certification_id = c.id
+WHERE ci.identity_name = 'john.smith'
+  AND ci.value = 'Finance-ReadOnly';
+-- If this row exists: certification was generated with this entitlement
+-- It will show in certification regardless of current account state
+
+-- The current Link state (what IIQ currently believes):
+SELECT la.attribute_name, la.attribute_value
+FROM spt_link l
+JOIN spt_link_attribute la ON l.id = la.link_id
+JOIN spt_application a ON l.application_id = a.id
+WHERE l.identity_id = (SELECT id FROM spt_identity WHERE name = 'john.smith')
+  AND a.name = '[Your AD Application Name]'
+  AND la.attribute_name = 'memberOf'
+  AND la.attribute_value LIKE '%Finance-ReadOnly%';
+-- If NO rows: Link is already updated or was never updated
+-- If rows exist: Link still shows the entitlement (aggregation not yet run)
+```
+
+**The resolution decision:**
+
+If John genuinely does not have Finance-ReadOnly in AD: the certifier should Revoke it in the certification. IIQ will attempt to provision the revocation. The provisioning will attempt to remove Finance-ReadOnly from his AD account. Since he does not have it, the provisioning should either succeed silently (no-op) or fail with "attribute value not found." Either way the certification item is resolved.
+
+What you should NOT do: re-aggregate John and then tell certifiers to trust the updated data — because the certification snapshot is immutable. The certifier still sees Finance-ReadOnly. You need a process for handling stale certification items, which in IIQ means: document the out-of-sync condition, have certifiers revoke phantom entitlements with a comment explaining the situation, and implement more frequent aggregation before future certification launches.
+
+---
+
+## The DERIVE Loop for IIQ Troubleshooting — The Meta-Pattern
+
+Every IIQ production issue follows the same five-round structure with one critical addition specific to IIQ:
+
+**Round 1 (D):** Describe the exact observed behavior with specific numbers — accounts scanned counts, workflow status values, exact log message text. The generic IIQ problem has a dozen possible causes. Your specific numbers eliminate most of them.
+
+**Round 2 (E + R):** Paste the actual log messages. Do not paraphrase them. The exact exception class name, the exact error message text, these are what allow the model to pattern-match against real IIQ knowledge rather than generate plausible-sounding IIQ language.
+
+**Round 3 (I):** Force the model to walk through the IIQ data model before recommending a fix. IIQ has many interconnected objects (Identity, Link, ManagedAttribute, ProvisioningTransaction, CertificationItem) and a fix that solves one object's stale data while ignoring another causes new problems.
+
+**Round 4 (V):** This is mandatory in IIQ, not optional. Every specific claim about IIQ behavior must be verified against Compass documentation or tested in non-production before production action. The model's IIQ knowledge is real but patchy and version-sensitive.
+
+**Round 5 (E — Expand):** Every IIQ issue has a downstream consequence you discover after the fix. The aggregation fix creates a duplicate link question. The provisioning fix reveals a thread pool sizing question. The certification fix reveals a process question about certification timing relative to aggregation. Round 5 surfaces these before they become the next incident.
+
+**The IIQ-specific addition — always ask about data model implications before fixing:**
+
+IIQ's data is highly interconnected. A fix that updates one table without updating the related table creates a new inconsistency. Before any fix, always ask: "Which IIQ tables or objects contain this data? If I fix the primary object, which related objects will now be out of sync?"
+
+The production knowledge you need for IIQ troubleshooting is partially in the LLM and partially in SailPoint Compass, your specific logs, and your specific database. DERIVE gets you the diagnostic framework and the IIQ data model reasoning. Your logs and Compass provide the verification layer that makes the diagnosis safe to act on.
+
+
+---------
+
 Before I answer, let me be honest about what "improve" means here.
 
 There are two completely different things you might mean:
