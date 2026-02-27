@@ -1,3 +1,506 @@
+Good project choice. Spring Boot and Go have genuinely complementary strengths — this isn't "use both because you can," there's a real architectural logic to it. But before the DERIVE application, you need the foundation that makes the framework useful here.
+
+---
+
+## The Actual Complementary Strengths First
+
+Without this, DERIVE has nothing real to work with.
+
+**Spring Boot's genuine strengths:**
+- Complex business logic with deep object graphs
+- Transaction management across multiple operations
+- Rich ecosystem for enterprise patterns — event sourcing, CQRS, saga orchestration
+- JPA/Hibernate for complex relational queries with associations
+- Spring Security for sophisticated auth flows — OAuth2, SAML, fine-grained RBAC
+- Mature messaging integration — Kafka, RabbitMQ with transactional outbox pattern
+
+**Go's genuine strengths:**
+- Raw HTTP throughput — 3-5x Spring Boot under equivalent load for simple request/response
+- Goroutine-based concurrency for I/O-bound fan-out work
+- Sub-millisecond latency consistency — GC pauses measured in microseconds vs. JVM milliseconds
+- Lightweight binaries — 10MB Docker image vs. 200MB+ for Spring Boot
+- Real-time workloads — WebSocket servers, streaming, SSE at high connection counts
+- Proxy and gateway layer — reverse proxying, rate limiting, connection management
+
+**The architectural logic:** Spring Boot owns the domain. Go owns the edge and the high-throughput paths.
+
+---
+
+## The Project: E-Commerce Platform
+
+Specific enough to be real. Complex enough to use both genuinely.
+
+**Spring Boot owns:**
+- Order management — complex state machines, distributed transactions
+- Inventory service — pessimistic locking, consistency guarantees
+- User and auth service — OAuth2, role-based access, session management
+- Payment orchestration — saga pattern, compensating transactions
+
+**Go owns:**
+- API Gateway — rate limiting, auth token validation, request routing
+- Product catalog service — high read throughput, simple data model, Redis caching
+- Real-time notifications — WebSocket connections, event fan-out
+- Search service — Elasticsearch proxying, result aggregation, sub-100ms SLA
+
+---
+
+## Now Apply DERIVE — Step by Step
+
+---
+
+### D — Destroy the Default Path
+
+The default path for "Spring Boot + Go microservices" produces: use Spring Boot for everything complex, Go for the gateway, communicate via REST. Every blog post about polyglot microservices says this. It's the tutorial answer and it has a ceiling.
+
+**How to destroy it:**
+
+**Level 1 — Add your actual constraints:**
+
+```
+I am building an e-commerce platform. Expected load: 
+50,000 daily active users, 800 product catalog requests/sec 
+at peak, 50 orders/minute peak, 5,000 concurrent WebSocket 
+connections for real-time order tracking.
+
+Stack decision already made: Spring Boot 3.2 for domain 
+services, Go 1.22 for high-throughput paths. Both teams 
+exist. Cannot change this.
+```
+
+**Level 2 — Add what you already know:**
+
+```
+I already know Spring Boot is better for complex transactions 
+and Go is better for throughput. Do not explain this.
+
+What I need: the specific service boundary decisions — 
+which operations belong in which runtime and why, with 
+the failure modes when that boundary is drawn wrong.
+```
+
+**Level 3 — Inject the contradiction:**
+
+```
+Our product catalog has 5 million SKUs. Each product has 
+complex pricing rules — tiered pricing, user-segment pricing, 
+promotional overlays. Simple read throughput suggests Go. 
+Complex pricing logic suggests Spring Boot. Standard 
+advice doesn't resolve this contradiction.
+```
+
+Now the model cannot give you the generic "Go for reads, Spring Boot for writes" answer. It has to reason about where pricing logic lives, which changes the entire service boundary discussion.
+
+**What the D-destroyed prompt produces that the generic doesn't:**
+
+The pricing logic contradiction resolves to a specific pattern: Go serves catalog reads from cache, Spring Boot owns the pricing calculation engine, Go calls Spring Boot only when pricing requires computation (cache miss on pricing, promotional event, segment-specific request). Cache hit rate target becomes a first-class architectural concern — if it's below 85%, Go's throughput advantage disappears in the Spring Boot round-trip latency.
+
+That's a real architectural insight. The generic prompt never gets there.
+
+---
+
+### E — Eliminate the Assumptions That Break Polyglot Architectures
+
+Polyglot service prompts have specific hidden assumptions that corrupt the architecture if left invisible.
+
+**Default assumptions to eliminate explicitly:**
+
+```
+Do NOT assume both services share a database. 
+Spring Boot owns its PostgreSQL schemas completely. 
+Go services have read-only Redis and their own 
+PostgreSQL schemas. No cross-service database access.
+
+Do NOT assume synchronous communication is fine between 
+services. Our order flow touches 4 services. If any 
+synchronous call fails, the order fails. We need 
+the failure boundary analysis for async vs sync per 
+service interaction.
+
+Do NOT assume our Go team knows Spring Boot internals 
+and vice versa. The contract between services is the 
+only interface. Design for teams that cannot read each 
+other's code.
+
+Do NOT assume we can tolerate eventual consistency 
+everywhere. Payment confirmation must be strongly 
+consistent. Product catalog can be eventually consistent 
+with 30-second lag. Order status must be consistent 
+within 2 seconds. These are different, not uniform.
+
+Do NOT assume our deployment infrastructure is 
+Kubernetes-native. We are on ECS. Service discovery 
+is via AWS Cloud Map, not k8s DNS. This changes 
+the inter-service communication patterns.
+```
+
+**What assumption elimination produces:**
+
+Each negation forces a specific architectural decision. "No cross-service database access" forces you to define exactly what data each service owns and what it publishes as events. "Different consistency requirements per operation" forces you to design the communication pattern per interaction rather than choosing one pattern globally.
+
+The concrete output: a service ownership map where each service has explicit data ownership, explicit API contracts, and explicit consistency guarantees — before you write a line of code.
+
+---
+
+### R — Reach the Long-Tail Knowledge on Polyglot Systems
+
+The tutorial knowledge on polyglot microservices covers: service contracts, API versioning, separate deployments. The long-tail knowledge covers: what breaks at 6 months, what breaks at 10x load, what breaks when one service's team makes a change without telling the other team.
+
+**Activation signal 1 — The migration post-mortem frame:**
+
+```
+You are an engineer who migrated a monolith to a 
+Spring Boot + Go polyglot architecture and wrote 
+a post-mortem 18 months later about what went wrong.
+
+Walk me through: the decisions that seemed right at 
+the start and caused incidents later, the service 
+boundary that was drawn wrong and what it cost to 
+fix it, and the one thing you'd tell a team starting 
+this migration today that they won't find in any 
+architecture blog post.
+```
+
+**What comes back from the long tail:**
+
+The most common post-mortem finding in polyglot systems is the distributed monolith — services that are separately deployed but tightly coupled through synchronous calls and shared data assumptions. The failure signature: a change to the Spring Boot order service's response format breaks the Go gateway silently (no compilation error, just wrong JSON parsing). It goes undetected until an edge case in production.
+
+The fix that comes from the long tail, not tutorials: contract testing with Pact or Spring Cloud Contract. Go and Spring Boot services both publish and consume contracts. CI breaks when a contract is violated before deployment. This pattern exists in training data from engineering teams that shipped polyglot systems. The tutorial answer would never surface it.
+
+**Activation signal 2 — The scale transition frame:**
+
+```
+This architecture worked at 100 req/sec. At 1,000 req/sec 
+the Go gateway started accumulating goroutines and 
+the Spring Boot order service P99 climbed to 8 seconds. 
+What specific interaction patterns between the two 
+services cause this failure mode, and what does it 
+look like in metrics before anyone understands what's 
+happening?
+```
+
+**Long-tail response surfaces:**
+
+The goroutine accumulation in Go happens when the Spring Boot service is slow — Go's gateway is holding goroutines open waiting for Spring Boot responses. Each goroutine is waiting on an HTTP connection to Spring Boot. The Go HTTP client connection pool to Spring Boot becomes the bottleneck. Specifically: `http.DefaultTransport` has `MaxIdleConnsPerHost` of 2 by default. At 1,000 req/sec hitting Spring Boot, Go is creating 998 new TCP connections per second, each taking ~50ms to establish. That's where the goroutines accumulate.
+
+```go
+// The fix that the long-tail response produces:
+transport := &http.Transport{
+    MaxIdleConns:        200,
+    MaxIdleConnsPerHost: 100,  // critical — default is 2
+    IdleConnTimeout:     90 * time.Second,
+    DisableKeepAlives:   false, // must be false for connection reuse
+}
+
+springBootClient := &http.Client{
+    Transport: transport,
+    Timeout:   5 * time.Second,
+}
+```
+
+One configuration change. Invisible in tutorials. Discovered in production. R surfaces it before you get there.
+
+**Activation signal 3 — The adversarial frame for service contracts:**
+
+```
+You are a senior engineer reviewing our service boundary 
+design before we build anything. Your job is to find 
+every place where the Spring Boot and Go services are 
+coupled in ways that will cause incidents. You are 
+not reviewing code — you are reviewing the interaction 
+design. Find the time bombs.
+```
+
+**What the adversarial frame produces:**
+
+Specific coupling risks for Spring Boot + Go:
+
+- Spring Boot's Jackson serialization sends `null` fields by default. Go's JSON unmarshaling silently ignores unknown fields. A Spring Boot field rename causes Go to silently use zero values instead of failing — your Go service processes orders with zero-value amounts
+- Spring Boot's `LocalDateTime` serializes differently based on `@JsonFormat` annotation presence. Go's `time.Time` unmarshaling is strict. Timezone mismatches cause silent data corruption in order timestamps
+- Spring Boot's pagination response wraps data in `{"content": [], "totalElements": 0}`. If Go expects a flat array, it silently gets an empty slice
+
+These are specific, real failure patterns. The adversarial frame pulls them out of post-mortem knowledge in the training data.
+
+---
+
+### I — Insert Reasoning Before Every Architecture Decision
+
+There are five major decisions in this project where I matters critically. For each one, the conclusion without reasoning is probably wrong for your specific constraints.
+
+**Decision 1 — Synchronous vs asynchronous between Go gateway and Spring Boot:**
+
+```
+Before recommending sync vs async for the Go gateway 
+to Spring Boot order service communication:
+
+Step 1: Analyze our specific failure modes. If the order 
+service is down, what should happen to the 800 req/sec 
+hitting the Go gateway? List every option and its 
+consequence.
+
+Step 2: For synchronous: walk through what happens to 
+Go goroutine accumulation when Spring Boot's P99 
+climbs from 200ms to 2 seconds during a flash sale.
+
+Step 3: For asynchronous with a queue: walk through 
+what happens to order confirmation UX when the queue 
+depth grows during the flash sale. What does the 
+customer see?
+
+Step 4: For a hybrid pattern (sync for read, async for 
+write): walk through the consistency guarantees and 
+where they break.
+
+Step 5: Tell me what you're uncertain about in our 
+specific setup that changes the answer.
+
+Only then give your recommendation.
+```
+
+**The forced reasoning produces:**
+
+The hybrid pattern is right — but the reasoning reveals a specific implementation detail tutorials skip. Sync for order reads (Go calls Spring Boot, waits for response, caches aggressively). Async for order writes (Go publishes to Kafka, Spring Boot consumes, Go polls or receives webhook for confirmation). But the webhook pattern requires Spring Boot to call back to Go, which means the Go gateway needs an internal callback endpoint that's not exposed to clients — a non-obvious architectural requirement that only surfaces through reasoning.
+
+**Decision 2 — Where the pricing engine lives:**
+
+```
+Before recommending where complex pricing logic lives:
+
+Step 1: Our pricing has 3 layers — base price (static, 
+cacheable), segment price (user-segment specific, 
+changes daily), promotional price (changes by the 
+minute during sales). Analyze which layer belongs 
+where and why.
+
+Step 2: If pricing logic lives in Spring Boot and 
+Go calls it per request: analyze the latency 
+impact at 800 req/sec catalog throughput assuming 
+Spring Boot P50 is 80ms.
+
+Step 3: If pricing logic is replicated to Go via 
+event stream: analyze the consistency risk when 
+a promotion starts and 30 seconds of stale prices 
+are served.
+
+Step 4: If Go handles base+segment price and Spring 
+Boot handles promotional overlay: analyze the 
+complexity of this split and what breaks when 
+a promotional price needs to interact with 
+segment pricing.
+
+Walk through all three before recommending.
+```
+
+**Decision 3 — Service discovery and health checking:**
+
+```
+Before recommending service discovery for ECS 
+(not Kubernetes):
+
+Step 1: We have 3 Go services and 4 Spring Boot 
+services. List every service-to-service communication 
+path and classify each as latency-sensitive or 
+throughput-sensitive.
+
+Step 2: For AWS Cloud Map: walk through the failure 
+mode when a Spring Boot instance fails mid-request 
+and Cloud Map hasn't deregistered it yet. What 
+does the Go client see? How long is the failure window?
+
+Step 3: For client-side load balancing vs ALB: 
+analyze the tradeoffs specifically for our ECS setup, 
+not generically.
+
+Only after all three steps: recommend with confidence level.
+```
+
+---
+
+### V — Verify the Critical Claims Before Building
+
+This project has specific claims that are easy to get wrong and expensive to discover late.
+
+**Verification 1 — The throughput claim:**
+
+Before building the Go gateway expecting 3-5x Spring Boot throughput, verify it for your specific workload:
+
+```
+The claim is that Go will handle 800 req/sec catalog 
+reads with sub-50ms P99. 
+
+What is the specific load test I should run to verify 
+this before committing to the architecture? What should 
+I measure — not just RPS but what specific metrics tell 
+me the architecture is working vs. accidentally hitting 
+a ceiling I haven't designed for?
+
+What would a result look like that tells me Go is NOT 
+the right choice for this specific workload?
+```
+
+**Verification 2 — The consistency boundary claim:**
+
+```
+We are claiming the catalog can tolerate 30 seconds 
+of eventual consistency. 
+
+Give me the strongest argument that this assumption 
+is wrong. What specific business scenario breaks 
+if a flash sale price update takes 30 seconds to 
+propagate? What is the customer-facing failure?
+
+Rate your confidence in the 30-second tolerance 
+as high/medium/low and tell me what would change it.
+```
+
+**Verification 3 — The contract testing claim:**
+
+```
+You recommended Pact for contract testing between 
+Go and Spring Boot services.
+
+Give me a concrete minimal example — the actual 
+Pact contract definition on the Spring Boot side 
+and the consumer test on the Go side for our 
+order creation endpoint. If you can't give me 
+runnable code, tell me where your knowledge 
+of Pact + Go integration becomes uncertain.
+```
+
+This last prompt is the most important verification technique for learning while building. If the model gives you runnable Pact + Go code, it's grounded knowledge. If it hedges, you know to go to the Pact documentation directly rather than trusting the output.
+
+**Verification 4 — The adversarial re-prompt on the full architecture:**
+
+After all decisions are made:
+
+```
+You are a skeptical principal engineer who thinks 
+this Spring Boot + Go architecture is over-engineered 
+for our scale and will cause more problems than a 
+well-structured Spring Boot monolith.
+
+Make the strongest possible case for that position 
+against our specific constraints — 50k DAU, 800 
+req/sec peak catalog, 50 orders/minute. 
+
+What is the break-even point where the operational 
+complexity of polyglot services is justified by 
+the performance benefits? Are we above or below it?
+```
+
+This is the most valuable verification for a project decision. If the adversarial case is weak — "the monolith can handle your scale easily, polyglot adds operational complexity without benefit" — it might be telling you something true. If the adversarial case requires assuming away your real constraints, your architecture is justified. Either way, you know before you build.
+
+---
+
+### E — Expand Iteratively Through the Build
+
+The iterative protocol for a project is different from a learning session. Each round maps to a build phase.
+
+**Round 1 — Architecture validation (before writing code):**
+
+Use D+E+R to get the full service map with ownership, communication patterns, consistency requirements, and failure modes. Output: an architecture decision record (ADR) for each major service boundary.
+
+**Round 2 — Contract definition (before implementing services):**
+
+Take the service boundary decisions from Round 1 and push deeper.
+
+```
+Your Round 1 response assumed our API contracts 
+would be defined as OpenAPI specs. We actually 
+need bidirectional contracts — Spring Boot and 
+Go both need to verify they're compatible.
+
+Given that Pact supports this but adds CI complexity, 
+and given we have 2 Go engineers and 3 Spring Boot 
+engineers who deploy independently: what is the 
+minimum viable contract testing setup that prevents 
+the silent JSON deserialization failures you 
+identified, without requiring both teams to 
+coordinate on every deployment?
+```
+
+**Round 3 — The hardest integration point in depth:**
+
+After Rounds 1-2, one integration point will be clearly the most complex. For this project it's probably the order creation flow — Go gateway receives request, Spring Boot processes order, inventory is decremented, payment is initiated, WebSocket notification goes out.
+
+```
+Walk through the order creation flow step by step 
+at the code level. For each service handoff:
+- What is the exact data contract?
+- What happens if this step fails?
+- What is the compensation action?
+- What does the customer see during the failure?
+
+Do not give me the happy path. Walk me through the 
+failure path for each step in sequence.
+```
+
+**Round 4 — Operational readiness:**
+
+```
+This system is 4 weeks from production. 
+
+You are the engineer writing the runbook for the 
+on-call rotation. Write the diagnostic decision tree 
+for the 3 most likely incidents in this architecture:
+
+1. Order creation P99 climbing above 5 seconds
+2. Product catalog returning stale prices during a promotion
+3. WebSocket connections dropping for a subset of users
+
+For each: what is the first metric I look at, what 
+are the possible causes ranked by probability, and 
+what is the first action for each cause?
+```
+
+**Round 5 — The unknown unknowns:**
+
+```
+We've made all major architectural decisions. 
+We're about to start implementation.
+
+What is the one thing about running Spring Boot 
+and Go services in production together that we 
+haven't asked about, that will surprise us in 
+the first 3 months of operation?
+
+Not generic microservices advice — something specific 
+to the Spring Boot + Go combination that engineers 
+consistently don't anticipate.
+```
+
+The last round is where you get things like: JVM GC pauses in Spring Boot cause latency spikes that the Go gateway sees as slow responses and may incorrectly circuit-break. Go's circuit breaker needs its timeout tuned to Spring Boot's GC pause duration, not just its normal response time. That's a specific, non-obvious operational fact about this exact combination that lives in the long tail and only surfaces when you've exhausted the standard questions.
+
+---
+
+## The One Thing That Makes This Work
+
+Every step above is useful. But the single highest-leverage thing you can do when using DERIVE for a project like this:
+
+**Run the adversarial verification before you commit to any architectural decision.**
+
+The prompt is always the same structure:
+
+```
+You are a senior engineer who thinks [decision we just made] 
+is wrong for our specific constraints.
+
+Make the strongest possible case against it.
+
+What would need to be true about our system for your 
+critique to be correct?
+
+Is any of that true?
+```
+
+If the strongest case against your decision requires assuming away your actual constraints — the critique fails. Your decision is justified. Build with confidence.
+
+If the critique holds under your actual constraints — you've caught an architectural mistake before writing code, which is the highest-value thing DERIVE can do for a project.
+
+That's not a framework trick. That's the fundamental mechanic working correctly: you've made the path toward "your decision is wrong" maximally probable, and if that path still leads nowhere, you have real evidence your decision is sound.
+
+
+-------
+
 This is the right question to ask. Most learning plans fail because they optimize for completeness. You need to optimize for leverage.
 
 Before DERIVE, one honest reframe:
