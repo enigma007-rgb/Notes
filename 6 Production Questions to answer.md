@@ -2881,3 +2881,1164 @@ Pick **one invariant** where you want to go deeper. I can:
 4. **Interview practice** — I ask invariant-based questions
 
 Which would be most valuable right now?
+
+
+----------
+
+The document you shared reframes everything correctly. Before the updated questions, lock in what changed and why it matters.
+
+---
+
+## What The Document Actually Changed
+
+The previous 6 questions were organized by **mechanism** — how data moves, how errors are handled. The invariant model organizes by **property to protect**. That's a fundamentally different mental posture.
+
+```
+Mechanism thinking: "I need to learn @Transactional"
+Invariant thinking: "I need to protect Consistency — 
+                     @Transactional is one tool that does it"
+
+The difference:
+Mechanism thinking breaks when you see a new framework.
+Invariant thinking transfers to every framework you'll ever use.
+```
+
+---
+
+## D — Destroy The Default Path
+
+```
+I am not asking for a list of topics.
+I am asking for the questions that production 
+systems ask of engineers — organized by the 
+property being protected, not the technology 
+implementing it.
+
+Each question must:
+- Reveal whether an engineer thinks in invariants 
+  or in memorized patterns
+- Have a failure mode that is concrete and specific
+- Have an economic dimension that separates mid 
+  from senior thinking
+- Apply to both Java/Spring and Go
+
+Skip questions that test trivia.
+Include only questions where the wrong mental model 
+causes real production incidents.
+```
+
+---
+
+## The 7 Production Questions — Rebuilt on Invariants
+
+---
+
+### INVARIANT 1: FLOW
+*"Requests must move through the system predictably — and degrade gracefully under saturation, not collapse"*
+
+---
+
+**The Question:**
+
+*"Walk me through what happens to your system when requests arrive faster than your system can process them. Not the happy path — the saturation path."*
+
+**Why this question:**
+It immediately separates engineers who know the happy path from engineers who've thought about the failure path. The happy path is documented everywhere. The saturation path lives in post-mortems.
+
+**What the wrong mental model produces:**
+
+```
+Wrong answer: "We'd add more servers."
+This assumes saturation is always a capacity problem.
+It's usually a backpressure problem — the system 
+accepts work faster than it can complete it,
+accumulating in-flight requests until it collapses.
+Adding servers makes this worse, not better.
+```
+
+**Java/Spring — the saturation signature:**
+
+```java
+// What collapse looks like in Spring Boot:
+// Tomcat thread pool: 200 threads
+// Each request takes 500ms (DB + external API)
+// At 400 req/sec: 400 * 0.5 = 200 threads needed
+// Exactly at capacity — queue starts building
+
+// One slow downstream call makes this worse:
+// External API starts taking 2s instead of 200ms
+// 400 * 2 = 800 thread-seconds needed
+// System has 200 thread-seconds per second
+// Queue grows at 4x rate
+// Memory fills with queued requests
+// System collapses — not slowly, suddenly
+
+// What protects Flow: backpressure at the boundary
+@Bean
+public TomcatServletWebServerFactory tomcatFactory() {
+    return new TomcatServletWebServerFactory() {
+        @Override
+        protected void customizeConnector(Connector connector) {
+            // Reject requests when queue full — don't accept what you can't process
+            ProtocolHandler handler = connector.getProtocolHandler();
+            if (handler instanceof AbstractProtocol<?> protocol) {
+                protocol.setMaxConnections(500);   // max concurrent connections
+                protocol.setAcceptCount(50);        // queue size before rejection
+                // When queue full: TCP connection rejected immediately
+                // Client gets fast failure, not 30s timeout
+                // This is backpressure — explicit degradation
+            }
+        }
+    };
+}
+
+// Circuit breaker — stop calling what's failing
+@Service
+public class ExternalApiService {
+    
+    // Resilience4j circuit breaker
+    @CircuitBreaker(name = "externalApi", fallbackMethod = "fallback")
+    public ApiResponse call(String request) {
+        return externalApi.call(request); // might be slow
+    }
+    
+    // When circuit opens (after N failures):
+    // Calls go here immediately — no waiting for timeout
+    // System stops accumulating goroutines/threads waiting on dead service
+    public ApiResponse fallback(String request, Exception e) {
+        return ApiResponse.degraded("service temporarily unavailable");
+    }
+}
+```
+
+**Go — backpressure through bounded channels:**
+
+```go
+// The wrong pattern — unbounded goroutine creation
+func handleRequest(w http.ResponseWriter, r *http.Request) {
+    go processAsync(r) // goroutine count grows with load, uncapped
+    w.WriteHeader(202)
+}
+// At 10,000 req/sec: 10,000 goroutines accumulating
+// Each holding memory, file descriptors, db connections
+// System collapses from resource exhaustion, not load
+
+// The right pattern — explicit backpressure
+type Server struct {
+    workQueue chan Request
+}
+
+func NewServer(capacity int) *Server {
+    s := &Server{
+        workQueue: make(chan Request, capacity), // bounded
+    }
+    // Fixed workers — system can only process this many simultaneously
+    for i := 0; i < runtime.NumCPU()*2; i++ {
+        go s.worker()
+    }
+    return s
+}
+
+func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
+    req := Request{w: w, r: r}
+    
+    select {
+    case s.workQueue <- req:
+        // Accepted — queue had space
+        w.WriteHeader(202)
+    default:
+        // Queue full — explicit rejection, fast failure
+        // Client gets 503 immediately, not 30s timeout
+        http.Error(w, "server busy", http.StatusServiceUnavailable)
+    }
+}
+```
+
+**The economic dimension (mid → senior shift):**
+
+```
+Mid: "We should add more servers to handle the load."
+
+Senior: "Adding servers without fixing backpressure 
+         means each new server collapses at the same 
+         load threshold — we're adding collapse points, 
+         not capacity. The fix is explicit rejection at 
+         the boundary, which costs nothing and stabilizes 
+         the system. Then we profile whether more servers 
+         are needed after the collapse is fixed."
+```
+
+---
+
+### INVARIANT 2: CONSISTENCY
+*"Data must reflect reality — and cross-service invariants need explicit modeling, not accidental hope"*
+
+---
+
+**The Question:**
+
+*"An order is placed. Payment succeeds. Inventory decrement fails. What state is your system in, and what is your recovery strategy?"*
+
+**Why this question:**
+It reveals whether an engineer thinks about distributed state. The wrong answer assumes the database handles this. Databases handle single-service consistency. Multi-service consistency is your problem.
+
+**What the wrong mental model produces:**
+
+```
+Wrong answer: "We'd use @Transactional to wrap the whole thing."
+@Transactional cannot span two microservices.
+It wraps one database connection.
+The engineer who says this has never thought about 
+what happens when services are separate processes.
+```
+
+**Java/Spring — the saga pattern:**
+
+```java
+// The naive approach — fails silently in distributed systems
+@Service
+public class OrderService {
+    
+    @Transactional // protects THIS service's db only
+    public Order placeOrder(OrderRequest request) {
+        Order order = orderRepo.save(new Order(request));
+        
+        // This is a REST call to another service
+        // @Transactional does nothing here
+        inventoryService.decrement(request.getProductId()); // can fail
+        paymentService.charge(request.getUserId(), order.getTotal()); // can fail
+        
+        // If inventoryService succeeds and paymentService fails:
+        // Order saved, inventory decremented, payment not taken
+        // System is in inconsistent state
+        // No automatic rollback — @Transactional can't reach across HTTP
+        return order;
+    }
+}
+
+// The saga pattern — explicit compensation
+@Service
+public class OrderSagaService {
+    
+    public Order placeOrder(OrderRequest request) {
+        Order order = orderRepo.save(
+            new Order(request, OrderStatus.PENDING)
+        );
+        
+        try {
+            // Step 1: Reserve inventory
+            String reservationId = inventoryService.reserve(
+                request.getProductId(), request.getQuantity()
+            );
+            
+            try {
+                // Step 2: Charge payment
+                String paymentId = paymentService.charge(
+                    request.getUserId(), order.getTotal()
+                );
+                
+                // Step 3: Confirm everything
+                inventoryService.confirm(reservationId);
+                order.setStatus(OrderStatus.CONFIRMED);
+                order.setPaymentId(paymentId);
+                return orderRepo.save(order);
+                
+            } catch (PaymentException e) {
+                // Payment failed — compensate inventory
+                inventoryService.release(reservationId); // compensating action
+                order.setStatus(OrderStatus.PAYMENT_FAILED);
+                orderRepo.save(order);
+                throw new OrderFailedException("Payment failed", e);
+            }
+            
+        } catch (InventoryException e) {
+            order.setStatus(OrderStatus.OUT_OF_STOCK);
+            orderRepo.save(order);
+            throw new OrderFailedException("Out of stock", e);
+        }
+    }
+}
+```
+
+**The outbox pattern — eventual consistency without data loss:**
+
+```java
+// Problem: save order AND publish event must be atomic
+// If you save then publish: app crashes between them, event lost
+// If you publish then save: event published for order that wasn't saved
+
+// Solution: outbox table in same database transaction
+@Transactional
+public Order placeOrder(OrderRequest request) {
+    Order order = orderRepo.save(new Order(request));
+    
+    // Write event to SAME database, SAME transaction
+    // If transaction commits: both order and event are saved
+    // If transaction rolls back: neither is saved
+    outboxRepo.save(new OutboxEvent(
+        "ORDER_PLACED",
+        objectMapper.writeValueAsString(order)
+    ));
+    
+    return order;
+    // Separate process reads outbox and publishes to Kafka
+    // At-least-once delivery, idempotent consumers
+}
+```
+
+**Go — the same problem, different syntax:**
+
+```go
+// Cross-service consistency requires explicit design in Go too
+type OrderSaga struct {
+    orders    OrderRepository
+    inventory InventoryClient
+    payment   PaymentClient
+}
+
+func (s *OrderSaga) PlaceOrder(ctx context.Context, req OrderRequest) (*Order, error) {
+    // Create order in pending state
+    order, err := s.orders.Create(ctx, req, StatusPending)
+    if err != nil {
+        return nil, fmt.Errorf("create order: %w", err)
+    }
+    
+    // Reserve inventory — get a reservation ID for compensation
+    reservationID, err := s.inventory.Reserve(ctx, req.ProductID, req.Quantity)
+    if err != nil {
+        _ = s.orders.UpdateStatus(ctx, order.ID, StatusOutOfStock)
+        return nil, fmt.Errorf("reserve inventory: %w", err)
+    }
+    
+    // Charge payment
+    paymentID, err := s.payment.Charge(ctx, req.UserID, order.Total)
+    if err != nil {
+        // Compensate: release reservation
+        _ = s.inventory.Release(ctx, reservationID)
+        _ = s.orders.UpdateStatus(ctx, order.ID, StatusPaymentFailed)
+        return nil, fmt.Errorf("charge payment: %w", err)
+    }
+    
+    // Confirm
+    order, err = s.orders.Confirm(ctx, order.ID, paymentID, reservationID)
+    if err != nil {
+        return nil, fmt.Errorf("confirm order: %w", err)
+    }
+    
+    return order, nil
+}
+```
+
+**The economic dimension:**
+
+```
+Mid: "We need a distributed transaction coordinator."
+
+Senior: "Distributed transactions are expensive — 
+         they require all participants to be available 
+         simultaneously, which reduces overall availability 
+         multiplicatively. If each service is 99.9% available,
+         a distributed transaction across 3 services is 
+         99.9³ = 99.7% available. We lose a day of availability 
+         per year just from coordination. Saga with compensation 
+         is more complex to implement but gives us independent 
+         availability per service. The implementation cost is 
+         one week. The availability gain is permanent."
+```
+
+---
+
+### INVARIANT 3: CAPACITY
+*"Resources must not exhaust — know your first-breaking resource before load hits, not after"*
+
+---
+
+**The Question:**
+
+*"Your service is getting 3x normal traffic. CPU is at 15%. Memory is fine. But response times are climbing. What is actually exhausted and how do you find it?"*
+
+**Why this question:**
+The answer is almost always connection pool exhaustion — not CPU, not memory, not the thing being monitored. Engineers who don't know this spend hours looking at the wrong metrics.
+
+**What the wrong mental model produces:**
+
+```
+Wrong answer: "I'd scale horizontally — add more instances."
+Adding instances splits the load but each instance 
+still has pool_size=10. You've now tripled your 
+exhausted instances. The problem scales with you.
+```
+
+**Java/Spring — finding the first-breaking resource:**
+
+```java
+// The metrics that expose pool exhaustion
+// (with Spring Boot Actuator + Micrometer)
+
+// 1. HikariCP metrics — exposed automatically
+// hikaricp.connections.active     — currently in use
+// hikaricp.connections.pending    — waiting for connection
+// hikaricp.connections.timeout    — gave up waiting
+
+// When you see: pending > 0 and timeout > 0
+// Your pool is the bottleneck, not your code
+
+// 2. Thread pool metrics
+// tomcat.threads.busy             — handling requests
+// tomcat.threads.current          — total alive
+
+// When busy == current: thread pool exhausted
+// New requests queuing or being rejected
+
+// Expose in application.properties:
+management.endpoints.web.exposure.include=health,metrics,prometheus
+management.metrics.tags.application=${spring.application.name}
+
+// The fix — tune to your actual bottleneck
+spring.datasource.hikari.maximum-pool-size=20
+# Rule: connections = (cpu_cores * 2) + disk_spindles
+# Not: connections = thread_pool_size
+
+// Add connection timeout that fails fast:
+spring.datasource.hikari.connection-timeout=3000  # 3s, not 30s
+# Fast failure + circuit breaker > slow failure + cascade
+
+// The metric that tells you if you've fixed it:
+// hikaricp.connections.pending should trend to 0
+// hikaricp.connections.timeout should trend to 0
+// Response time P99 should drop proportionally
+```
+
+**Go — the same diagnostic:**
+
+```go
+// Expose pprof — the Go production diagnostic tool
+import _ "net/http/pprof"
+
+func main() {
+    // Separate port — don't expose pprof on public port
+    go func() {
+        http.ListenAndServe("localhost:6060", nil)
+    }()
+    // ...
+}
+
+// Under load, check goroutine count:
+// curl localhost:6060/debug/pprof/goroutine?debug=1
+
+// What you're looking for:
+// 10000 goroutines all blocked on:
+//   database/sql.(*DB).conn
+// This is connection pool exhaustion in Go
+
+// The pool configuration that prevents it:
+pool, _ := pgxpool.NewWithConfig(ctx, config)
+config.MaxConns = 20            // tune to DB capacity
+config.MinConns = 5             // keep warm — no cold start latency
+config.MaxConnLifetime = time.Hour
+config.MaxConnIdleTime = 30 * time.Minute
+config.ConnectConfig.ConnectTimeout = 3 * time.Second // fail fast
+
+// The metric to watch during load test:
+// pool.Stat().AcquiredConns()  — currently in use
+// pool.Stat().MaxConns()       — ceiling
+// When acquired approaches max: you're at the limit
+// When acquire requests start queuing: you've hit it
+
+// Expose as custom metric:
+go func() {
+    for range time.Tick(10 * time.Second) {
+        stats := pool.Stat()
+        slog.Info("pool stats",
+            "acquired", stats.AcquiredConns(),
+            "idle", stats.IdleConns(),
+            "total", stats.TotalConns(),
+            "max", stats.MaxConns(),
+        )
+    }
+}()
+```
+
+**The economic dimension:**
+
+```
+Mid: "We need to scale out — add more instances."
+
+Senior: "Scaling out multiplies the problem if the 
+         bottleneck is per-instance pool size. Before 
+         scaling, I need to know what's exhausted. 
+         CPU at 15% tells me compute isn't the bottleneck. 
+         I'd check hikaricp.connections.pending first — 
+         if that's non-zero, I tune pool size before 
+         touching instance count. Pool size increase is 
+         a config change. Horizontal scale is an infra 
+         cost. I'd spend 10 minutes on config before 
+         spending money on infra."
+```
+
+---
+
+### INVARIANT 4: LATENCY
+*"Tail latency determines user experience — P99, not P50, is your real SLA"*
+
+---
+
+**The Question:**
+
+*"Your P50 latency is 50ms. Your P99 is 4 seconds. Your average is 80ms. Which number do you fix and why?"*
+
+**Why this question:**
+Most engineers optimize for averages. Averages are mathematically deceptive — they hide the distribution. P99 is what 1 in 100 users experience. At scale, that's thousands of users per hour.
+
+**What the wrong mental model produces:**
+
+```
+Wrong answer: "The average looks fine, I'd investigate P99 
+               but it's probably an outlier."
+P99 = 4 seconds is a serious problem.
+At 1000 req/sec: 10 users per second experience 4s response.
+600 users per minute. 36,000 per hour.
+"Probably an outlier" is exactly wrong — it's systematic.
+```
+
+**Java/Spring — the P99 investigation toolkit:**
+
+```java
+// What causes P99 spikes specifically (not P50):
+// 1. GC pauses — stop-the-world GC pauses hit random requests
+// 2. Connection pool wait — requests that waited for a connection
+// 3. Lock contention — requests that hit a contested resource
+// 4. Cold cache — first requests after cache invalidation
+// 5. Slow downstream — one external call on the critical path
+
+// Measure tail latency explicitly with Micrometer:
+@Configuration
+public class MetricsConfig {
+    
+    @Bean
+    public MeterRegistryCustomizer<MeterRegistry> metricsConfig() {
+        return registry -> {
+            // Configure histogram buckets that capture your SLA
+            registry.config().meterFilter(
+                new MeterFilter() {
+                    @Override
+                    public DistributionStatisticConfig configure(
+                            Meter.Id id, DistributionStatisticConfig config) {
+                        if (id.getName().contains("http.server.requests")) {
+                            return DistributionStatisticConfig.builder()
+                                .percentiles(0.5, 0.90, 0.95, 0.99, 0.999)
+                                .percentilePrecision(2)
+                                .build()
+                                .merge(config);
+                        }
+                        return config;
+                    }
+                }
+            );
+        };
+    }
+}
+
+// Add timing to every external call — find which one is your P99 culprit
+@Service
+public class UserService {
+    
+    private final Timer dbTimer;
+    private final Timer cacheTimer;
+    private final Timer externalApiTimer;
+    
+    public UserService(MeterRegistry registry) {
+        this.dbTimer = registry.timer("service.db.query", "operation", "getUser");
+        this.cacheTimer = registry.timer("service.cache.get", "operation", "getUser");
+        this.externalApiTimer = registry.timer("service.external.call", "operation", "getScore");
+    }
+    
+    public UserProfile getProfile(String userId) {
+        // Time each component separately
+        // When P99 spikes, you know WHICH component caused it
+        
+        User user = dbTimer.record(() -> userRepo.findById(userId));
+        Integer score = externalApiTimer.record(() -> scoringApi.getScore(userId));
+        
+        return buildProfile(user, score);
+    }
+}
+```
+
+**Go — tail latency amplification in fan-out:**
+
+```go
+// The tail latency amplification problem:
+// You call 3 services in parallel.
+// P99 of each service is 100ms.
+// P99 of your endpoint is NOT 100ms.
+// It's the P99 of MAX(service1, service2, service3).
+// Which is approximately 100ms * 3 = 270ms for high percentiles.
+// This is tail latency amplification — parallel calls amplify tail.
+
+func getProfile(ctx context.Context, userID string) (*Profile, error) {
+    
+    // Naive parallel — P99 = max(all P99s)
+    type result struct {
+        user  *User
+        score *Score
+        prefs *Preferences
+        err   error
+    }
+    
+    ch := make(chan result, 1)
+    
+    // Add aggressive timeout — don't let slow tail determine your tail
+    ctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+    defer cancel()
+    
+    var wg sync.WaitGroup
+    var user *User
+    var score *Score
+    var prefs *Preferences
+    var errs []error
+    var mu sync.Mutex
+    
+    wg.Add(3)
+    go func() {
+        defer wg.Done()
+        u, err := userSvc.Get(ctx, userID)
+        mu.Lock()
+        if err != nil { errs = append(errs, err) } else { user = u }
+        mu.Unlock()
+    }()
+    
+    go func() {
+        defer wg.Done()
+        s, err := scoreSvc.Get(ctx, userID)
+        mu.Lock()
+        if err != nil { errs = append(errs, err) } else { score = s }
+        mu.Unlock()
+    }()
+    
+    go func() {
+        defer wg.Done()
+        p, err := prefsSvc.Get(ctx, userID)
+        mu.Lock()
+        if err != nil { errs = append(errs, err) } else { prefs = p }
+        mu.Unlock()
+    }()
+    
+    wg.Wait()
+    
+    // Handle partial results — not all or nothing
+    // Degraded profile is better than 4s timeout
+    return buildProfile(user, score, prefs, errs), nil
+}
+```
+
+**The economic dimension:**
+
+```
+Mid: "P99 is high but it's only 1% of requests — 
+      not worth prioritizing over new features."
+
+Senior: "At 10,000 req/sec, P99 = 4s means 100 users 
+         per second experiencing 4-second responses. 
+         That's 6,000 users per minute. Studies show 
+         users abandon after 3 seconds. We're losing 
+         conversions on those requests. The revenue 
+         impact is measurable. Before fixing, I'd 
+         quantify it: average order value × abandonment 
+         rate × affected requests per day. Then I know 
+         exactly how much engineering time this is worth."
+```
+
+---
+
+### INVARIANT 5: TRUST
+*"Every request must prove identity and authorization — and must not expose data beyond its authorization boundary"*
+
+---
+
+**The Question:**
+
+*"User A is authenticated. User A requests /users/B/profile. How does your system ensure User A can't see User B's private data — and what are the three places this check can be implemented incorrectly?"*
+
+**Why this question:**
+Authentication (who are you) is easy. Authorization (what can you do) has three common failure modes that appear in production security incidents regularly.
+
+**What the wrong mental model produces:**
+
+```
+Wrong answer: "We check the JWT and verify the role."
+Role-based check passes for User A (they're authenticated).
+But they're requesting ANOTHER USER'S data.
+Role check is necessary but not sufficient.
+Object-level authorization is the missing piece.
+```
+
+**Java/Spring — the three failure modes:**
+
+```java
+// Failure Mode 1: Missing object-level authorization
+// (The most common OWASP API vulnerability — BOLA/IDOR)
+
+// BROKEN — checks authentication, not authorization
+@GetMapping("/users/{userId}/profile")
+public UserProfile getProfile(@PathVariable String userId) {
+    // JWT is valid — user is authenticated
+    // But is THIS user allowed to see THAT user's profile?
+    // No check. Any authenticated user can see any profile.
+    return userService.getProfile(userId);
+}
+
+// FIXED — check ownership at the service layer
+@GetMapping("/users/{userId}/profile")
+public UserProfile getProfile(
+        @PathVariable String userId,
+        @AuthenticationPrincipal String currentUserId) {
+    
+    return userService.getProfile(userId, currentUserId);
+}
+
+@Service
+public class UserService {
+    
+    public UserProfile getProfile(String targetUserId, String requesterId) {
+        // Object-level authorization: are you allowed to see this?
+        if (!targetUserId.equals(requesterId) && 
+            !authService.isAdmin(requesterId)) {
+            throw new AccessDeniedException(
+                "User " + requesterId + " cannot access profile of " + targetUserId
+            );
+        }
+        return userRepo.findById(targetUserId)
+                       .map(UserProfile::from)
+                       .orElseThrow();
+    }
+}
+
+// Failure Mode 2: Authorization in the controller only
+// (Attack: call service layer directly in tests, or via event)
+
+// BROKEN — authorization only at HTTP layer
+@GetMapping("/orders/{orderId}")
+@PreAuthorize("isAuthenticated()")
+public Order getOrder(@PathVariable String orderId) {
+    return orderService.getOrder(orderId); // no ownership check here
+}
+
+// FIXED — authorization at service layer too
+// HTTP layer: authentication
+// Service layer: authorization (ownership, role, policy)
+// This way: even if called from event handlers, jobs, tests —
+// authorization is always enforced
+
+// Failure Mode 3: Data leakage in response
+// (Returning more than the caller should see)
+
+// BROKEN — returns full entity including sensitive fields
+public User getUser(String id) {
+    return userRepo.findById(id); // includes passwordHash, ssn, internalNotes
+}
+
+// FIXED — explicit response DTO, no sensitive fields
+public UserPublicProfile getUser(String id) {
+    User user = userRepo.findById(id);
+    return UserPublicProfile.builder()
+        .id(user.getId())
+        .name(user.getName())
+        .avatarUrl(user.getAvatarUrl())
+        // passwordHash, ssn, internalNotes: not included
+        .build();
+}
+```
+
+**Go — same three failure modes:**
+
+```go
+// Object-level authorization middleware
+func RequireOwnership(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        currentUserID := r.Context().Value(userIDKey).(string)
+        targetUserID := chi.URLParam(r, "userId")
+        
+        // Is requester accessing their own resource?
+        if currentUserID == targetUserID {
+            next.ServeHTTP(w, r)
+            return
+        }
+        
+        // Is requester an admin?
+        roles := r.Context().Value(rolesKey).([]string)
+        for _, role := range roles {
+            if role == "admin" {
+                next.ServeHTTP(w, r)
+                return
+            }
+        }
+        
+        // Neither — reject
+        http.Error(w, "forbidden", http.StatusForbidden)
+    })
+}
+
+// Data leakage — explicit response struct
+type UserPublicResponse struct {
+    ID        string `json:"id"`
+    Name      string `json:"name"`
+    AvatarURL string `json:"avatar_url"`
+    // PasswordHash deliberately absent
+    // SSN deliberately absent
+    // InternalNotes deliberately absent
+}
+
+// Never return the domain object directly
+func handleGetUser(w http.ResponseWriter, r *http.Request) {
+    user, err := userSvc.Get(r.Context(), chi.URLParam(r, "userId"))
+    if err != nil { /* handle */ }
+    
+    // Explicit mapping — you decide what leaves your system
+    response := UserPublicResponse{
+        ID:        user.ID,
+        Name:      user.Name,
+        AvatarURL: user.AvatarURL,
+    }
+    
+    json.NewEncoder(w).Encode(response)
+}
+```
+
+**The economic dimension:**
+
+```
+Mid: "We have JWT authentication — the system is secure."
+
+Senior: "Authentication tells us who you are. 
+         Authorization tells us what you can do.
+         Data boundary tells us what you can see.
+         These are three separate properties, each 
+         with independent failure modes. A breach 
+         from BOLA (object-level auth bypass) costs 
+         more than the entire engineering team's 
+         annual salary in regulatory fines and 
+         remediation. The implementation cost of 
+         object-level checks is one week. 
+         The risk cost of skipping it is unbounded."
+```
+
+---
+
+### INVARIANT 6: OBSERVABILITY
+*"Every failure must be diagnosable — every metric must have an owner and an action, not just a dashboard"*
+
+---
+
+**The Question:**
+
+*"Your on-call engineer gets paged at 2am. Error rate is elevated. Walk me through exactly what they look at, in what order, and what action each metric triggers."*
+
+**Why this question:**
+Observability without actionability is decoration. Most teams have dashboards nobody looks at. Senior engineers design observability so that the on-call path is a decision tree, not a guessing game.
+
+**The on-call decision tree — Java/Spring:**
+
+```java
+// Step 1: Error rate alert fires
+// Metric: http.server.requests{status=5xx} > threshold
+// Action: look at error rate by endpoint
+
+// Step 2: Which endpoint?
+// Metric: http.server.requests by uri, status
+// Action: identify the failing endpoint
+
+// Step 3: What's the error?
+// Metric: structured logs with requestId, error type, stack
+// Action: find the error class
+
+@ControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ErrorResponse> handleAll(
+            Exception e, HttpServletRequest request) {
+        
+        // Every error: same structured log
+        // Queryable by: requestId, endpoint, errorType, userId
+        String requestId = (String) request.getAttribute("requestId");
+        
+        slog.error("Request failed",
+            "requestId", requestId,
+            "endpoint", request.getRequestURI(),
+            "method", request.getMethod(),
+            "errorType", e.getClass().getSimpleName(),
+            "errorMessage", e.getMessage(),
+            "userId", getCurrentUserId()
+        );
+        
+        // Don't leak internal errors to client
+        return ResponseEntity.status(500)
+            .body(new ErrorResponse(requestId, "internal error"));
+        // Client gets requestId — they can send it to support
+        // Support queries logs by requestId — full trace
+    }
+}
+
+// Step 4: Is it infrastructure or code?
+// Metric: hikaricp.connections.pending, jvm.gc.pause, 
+//         external.service.latency
+// Action: if pool pending → tune pool
+//         if gc.pause > 200ms → tune GC or memory
+//         if external latency → check circuit breaker
+
+// Step 5: Is it getting worse or better?
+// Metric: error rate trend (5min, 15min, 1hr)
+// Action: if getting worse → escalate, consider rollback
+//         if stable → investigate without escalating
+//         if improving → probably a transient spike
+
+// The alert that triggers this tree:
+// Every alert must have: runbook URL in the alert body
+// Runbook = this decision tree written down
+// On-call shouldn't debug from memory at 2am
+```
+
+**Go — the same decision tree:**
+
+```go
+// Structured logging — every field queryable
+func handleOrder(w http.ResponseWriter, r *http.Request) {
+    requestID := r.Context().Value(requestIDKey).(string)
+    userID := r.Context().Value(userIDKey).(string)
+    start := time.Now()
+    
+    order, err := orderSvc.Place(r.Context(), parseOrderRequest(r))
+    
+    duration := time.Since(start)
+    
+    if err != nil {
+        // Every error field is queryable in log aggregator
+        slog.Error("order placement failed",
+            "requestId", requestID,
+            "userId", userID,
+            "duration_ms", duration.Milliseconds(),
+            "errorType", fmt.Sprintf("%T", err),
+            "error", err,
+        )
+        http.Error(w, requestID, http.StatusInternalServerError)
+        return
+    }
+    
+    slog.Info("order placed",
+        "requestId", requestID,
+        "userId", userID,
+        "orderId", order.ID,
+        "amount", order.Total,
+        "duration_ms", duration.Milliseconds(),
+    )
+    
+    json.NewEncoder(w).Encode(order)
+}
+
+// Health check with actionable detail
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+    ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+    defer cancel()
+    
+    health := map[string]string{"status": "ok"}
+    statusCode := 200
+    
+    if err := db.Ping(ctx); err != nil {
+        health["database"] = "unavailable: " + err.Error()
+        health["status"] = "degraded"
+        statusCode = 503
+        slog.Error("health check: database unavailable", "error", err)
+    }
+    
+    if err := cache.Ping(ctx).Err(); err != nil {
+        health["cache"] = "unavailable: " + err.Error()
+        // Cache unavailable — degraded but not down
+        slog.Warn("health check: cache unavailable", "error", err)
+    }
+    
+    w.WriteHeader(statusCode)
+    json.NewEncoder(w).Encode(health)
+}
+```
+
+**The economic dimension:**
+
+```
+Mid: "We have a Grafana dashboard with all our metrics."
+
+Senior: "A dashboard nobody looks at is not observability —
+         it's theater. Real observability means:
+         1. Alerts fire on symptoms (high error rate, 
+            high latency) not causes (high CPU)
+         2. Every alert links to a runbook
+         3. Every runbook is a decision tree, not prose
+         4. Every metric has an owner who acts on it
+         
+         The cost of good observability is one week 
+         to set up, one hour per week to maintain.
+         The cost of bad observability is the mean 
+         time to recovery during incidents — which 
+         at 3x for every hour without it at 2am."
+```
+
+---
+
+### INVARIANT 7: ECONOMICS
+*"Every technical decision is a tradeoff — senior engineers make the tradeoff explicit before implementing"*
+
+---
+
+**The Question:**
+
+*"Your team wants to add Redis caching to reduce database load. Walk me through how you decide whether to do it."*
+
+**Why this question:**
+It's not a technical question. It's a decision-making question. The answer reveals whether the engineer thinks in tradeoffs or in patterns.
+
+**The decision framework:**
+
+```
+Question 1: What is the actual problem?
+  - Is DB load actually a problem? (metric: db CPU, slow query log)
+  - Or are we caching preemptively? (premature optimization)
+  - If load isn't a problem: don't add complexity
+
+Question 2: What does the cache actually cost?
+  - Operational: Redis is another system to run, monitor, fail
+  - Complexity: cache invalidation is hard — new failure mode
+  - Consistency: stale data is now possible — is that acceptable?
+  - Money: Redis instance cost per month
+
+Question 3: What does it actually buy?
+  - Expected cache hit rate (if < 70%: probably not worth it)
+  - DB load reduction (if DB is at 20% CPU: is this necessary?)
+  - Latency improvement (if DB P99 is 20ms: is 5ms improvement worth it?)
+
+Question 4: What breaks that didn't break before?
+  - Cache invalidation bugs (update DB but forget to evict cache)
+  - Cache stampede (cache expires, 10,000 requests hit DB simultaneously)
+  - Cache poisoning (wrong data cached due to bug)
+  - Split-brain (app and cache disagree on state)
+
+The senior answer:
+"Before adding Redis, I want to see: 
+  DB CPU > 60% sustained, OR
+  DB P99 > 200ms, OR  
+  DB cost is growing faster than business metrics.
+
+If none of those: the problem doesn't exist yet.
+If one of those: can we fix with query optimization first?
+  (An index is operationally free. Redis is operationally expensive.)
+If query optimization is insufficient: then Redis.
+
+When we add Redis: we need cache invalidation strategy,
+stampede protection (lock or probabilistic early expiration),
+and circuit breaker so Redis failure doesn't cascade to app failure."
+```
+
+**The code that implements the senior decision:**
+
+```java
+@Service
+public class UserService {
+    
+    // Cache stampede protection — only one thread recalculates
+    // Others wait rather than all hitting DB simultaneously
+    private final Map<String, CompletableFuture<User>> inFlight = 
+        new ConcurrentHashMap<>();
+    
+    public User getUser(String userId) {
+        // Check cache first
+        User cached = cache.get("user:" + userId);
+        if (cached != null) return cached;
+        
+        // Stampede protection: if another thread is already fetching,
+        // wait for their result instead of making another DB call
+        CompletableFuture<User> future = inFlight.computeIfAbsent(
+            userId,
+            id -> CompletableFuture.supplyAsync(() -> {
+                User user = userRepo.findById(id);
+                cache.put("user:" + id, user, Duration.ofMinutes(5));
+                return user;
+            }).whenComplete((u, ex) -> inFlight.remove(id))
+        );
+        
+        try {
+            return future.get(3, TimeUnit.SECONDS);
+        } catch (TimeoutException e) {
+            // Cache/DB both slow — fail fast, don't block
+            throw new ServiceUnavailableException("user service timeout");
+        }
+    }
+}
+```
+
+```go
+// Go — same stampede protection with singleflight
+import "golang.org/x/sync/singleflight"
+
+type UserService struct {
+    group singleflight.Group
+    cache Cache
+    db    UserRepository
+}
+
+func (s *UserService) GetUser(ctx context.Context, id string) (*User, error) {
+    // Check cache
+    if user, ok := s.cache.Get("user:" + id); ok {
+        return user.(*User), nil
+    }
+    
+    // singleflight: if multiple goroutines call with same id,
+    // only ONE hits the database — others wait and share result
+    result, err, _ := s.group.Do("user:"+id, func() (interface{}, error) {
+        user, err := s.db.Get(ctx, id)
+        if err != nil {
+            return nil, err
+        }
+        s.cache.Set("user:"+id, user, 5*time.Minute)
+        return user, nil
+    })
+    
+    if err != nil {
+        return nil, fmt.Errorf("get user %s: %w", id, err)
+    }
+    
+    return result.(*User), nil
+}
+```
+
+---
+
+## The Complete Updated Map
+
+```
+INVARIANT          QUESTION IT ANSWERS              FAILURE COST
+─────────────────────────────────────────────────────────────────
+Flow               Can your system say no            Cascade collapse
+                   before it collapses?              under load
+
+Consistency        What happens when step 2          Permanent data
+                   of a multi-step operation fails?  inconsistency
+
+Capacity           What is your first-breaking       Sudden total
+                   resource under load?              failure at
+                                                     threshold
+
+Latency            What does your P99 user           Revenue loss,
+                   experience?                       user abandonment
+
+Trust              Can User A access User B's        Security breach,
+                   data?                             regulatory fine
+
+Observability      Can your on-call engineer         Long MTTR,
+                   diagnose a 2am incident           compounding
+                   in 10 minutes?                    outages
+
+Economics          Did you make the tradeoff         Unnecessary
+                   explicit before building?         complexity,
+                                                     wrong solution
+```
+
+Every concept you learn from here belongs to one of these seven. When you encounter something new — a framework feature, a design pattern, an interview question — ask which invariant it protects. If you can't answer that, you don't need to learn it yet.
