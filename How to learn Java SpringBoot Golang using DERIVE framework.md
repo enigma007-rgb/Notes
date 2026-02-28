@@ -1,3 +1,1078 @@
+Before applying DERIVE, lock in the exact mental model you're building toward. Everything else derives from this.
+
+---
+
+## The One Mental Model That Unifies Everything
+
+Every question you asked — object creation, method calling, object wiring — reduces to this single chain:
+
+```
+Reference → Heap Object → Class Metadata → Method Table
+```
+
+That's it. Every mechanism in Java is either building this chain, navigating it, or automating its construction. DERIVE's job here is to make the long-tail operational knowledge about this chain the highest-probability response at every step.
+
+---
+
+## D — Destroy the Default Path
+
+The default path for "how are objects created in Java" produces: `new` keyword, constructor runs, object lives on heap. For method calls: method lookup, execution. For wiring: dependency injection, Spring handles it.
+
+That path has a ceiling exactly where real understanding begins.
+
+**Progressive destruction:**
+
+**Level 1 — Add the operational frame:**
+
+```
+I am not asking how to create objects syntactically.
+I am asking what the JVM is physically doing at the 
+memory level during creation, method dispatch, and 
+wiring — specifically the parts that produce bugs 
+when you don't understand them.
+
+I already know: new keyword, constructors, basic 
+Spring @Autowired. Skip all of this.
+```
+
+**Level 2 — Add stack specifics that force depth:**
+
+```
+I am building a mini IoC container. I need to 
+understand object creation well enough to replicate 
+what Spring does with reflection. I need to 
+understand method dispatch well enough to implement 
+a proxy. I need to understand wiring well enough 
+to manage circular dependencies.
+
+The tutorial explanation is insufficient for this.
+Start where the tutorial stops.
+```
+
+**Level 3 — Inject the contradictions:**
+
+```
+Contradiction 1: Two objects created from the same 
+class share no instance data but share method 
+implementations. How? Where do the methods live 
+if not in each object?
+
+Contradiction 2: An interface has no implementation.
+A reference of interface type calls a method and 
+gets the right implementation at runtime. The 
+compiler doesn't know which implementation. 
+How does the JVM know?
+
+Contradiction 3: Spring creates objects you never 
+called new on. It injects dependencies in the right 
+order without you specifying the order. 
+What mechanism makes this possible?
+```
+
+Now "objects live on the heap" is structurally improbable. The model has to engage with method table separation, vtable lookup, and reflection-based dependency graph construction.
+
+---
+
+## E — Eliminate the Assumptions
+
+Default assumptions baked into every Java object tutorial:
+
+```
+Do NOT assume I want syntax explanation. I want 
+memory layout explanation — what bytes are where.
+
+Do NOT assume objects contain their methods. 
+Explain what an object actually contains vs. 
+what lives in class metadata.
+
+Do NOT assume new is the only creation mechanism 
+that matters. I need to understand reflection-based 
+creation deeply because that is what frameworks use.
+
+Do NOT assume method calls are simple function calls.
+Explain the dispatch mechanisms — static binding, 
+dynamic dispatch, interface dispatch — as separate 
+mechanisms with different runtime costs and 
+different failure modes.
+
+Do NOT assume wiring is just "passing references."
+Explain the difference between compile-time wiring,
+runtime wiring, and framework-managed wiring at 
+the mechanism level.
+
+Do NOT assume I'm asking about happy paths. 
+Explain what breaks at each layer when the 
+mechanism is misused.
+```
+
+**What elimination forces out immediately:**
+
+The distinction most tutorials collapse: an object does NOT contain its methods. An object on the heap contains:
+
+```
+[Object Header    ] — 12-16 bytes
+  ├── Mark Word   — GC info, hash code, lock state
+  └── Klass Pointer — pointer to Class Metadata (not the methods themselves)
+[Instance Fields  ] — one slot per field, ordered by JVM
+```
+
+The methods live in Class Metadata — one copy, shared across all instances. When you create 10,000 `User` objects, you have 10,000 objects on the heap each with their own `name` and `email` fields — but exactly one copy of `greet()` in the metaspace.
+
+This is the answer to Contradiction 1. And it's the foundation for understanding everything that follows.
+
+---
+
+## R — Reach the Long Tail
+
+**Signal 1 — The JVM internals post-mortem frame:**
+
+```
+You are a JVM engineer explaining to a developer 
+why their application has unexpected memory behavior.
+They created 100,000 objects and expected high memory 
+usage from methods. Actual memory usage is much lower 
+than expected. Walk through why their mental model 
+was wrong and what the correct model is.
+```
+
+**What surfaces from the long tail:**
+
+The complete heap layout for a real object:
+
+```java
+class User {
+    String name;     // 4 bytes (compressed reference)
+    int age;         // 4 bytes
+    boolean active;  // 1 byte (padded to 4)
+}
+```
+
+Actual heap layout per User instance:
+
+```
+[Mark Word:     8 bytes ] — GC state, lock info, identity hash
+[Klass Pointer: 4 bytes ] — compressed pointer to User.class metadata
+[name field:    4 bytes ] — reference to String object (elsewhere on heap)
+[age field:     4 bytes ] — primitive int, stored directly
+[active field:  1 byte  ] — primitive boolean
+[padding:       3 bytes ] — JVM aligns to 8-byte boundaries
+Total: 24 bytes per User instance
+```
+
+And in Metaspace (shared, one copy regardless of instance count):
+
+```
+User.class metadata:
+  - Field descriptors (name, type, offset of each field)
+  - Method bytecode for greet(), getName(), etc.
+  - Constant pool
+  - vtable (virtual method table)
+  - itable (interface method table)
+```
+
+The operational insight: if you have a memory leak with 100,000 User objects, you're looking at 100,000 × 24 bytes = ~2.4MB for the objects themselves. The methods cost nothing per instance. The String objects each `name` field points to are the actual memory cost. This is what directs you to profile object count × field size, not object count × class size.
+
+**Signal 2 — The "how frameworks actually work" frame:**
+
+```
+You are a framework engineer explaining to someone 
+building their first IoC container why reflection-based 
+object creation is fundamentally different from 
+new-based creation at the JVM level. What are the 
+specific mechanisms, costs, and failure modes that 
+only appear when creating objects via reflection?
+```
+
+**Long-tail response:**
+
+The five creation mechanisms, with what each one actually does at the JVM level:
+
+---
+
+### Mechanism 1 — `new` keyword
+
+```java
+User u = new User("Alice", 30);
+```
+
+**What the JVM physically does, step by step:**
+
+```
+Step 1: Class loading check
+  JVM checks if User.class is in the bootstrap/system 
+  classloader's cache. If not, ClassLoader.loadClass() 
+  is called — finds the .class file, reads bytecode, 
+  parses constant pool, stores in Metaspace.
+
+Step 2: Memory allocation
+  JVM calculates object size from class metadata.
+  Allocates contiguous block in Eden space (Young Gen).
+  Uses bump-pointer allocation — extremely fast, 
+  just moves a pointer forward by object size.
+  ~10ns for allocation when Eden has space.
+
+Step 3: Zero-fill
+  JVM sets all fields to zero values before constructor runs.
+  This is why fields have defaults — not magic, just 
+  zeroed memory interpreted as each type's zero.
+  int → 0, boolean → false, reference → null.
+
+Step 4: Constructor execution
+  invokespecial bytecode instruction called.
+  New stack frame pushed for User.<init>.
+  Parameters bound to local variables.
+  Field assignments execute.
+  Stack frame popped on return.
+
+Step 5: Reference assignment
+  Memory address of new object assigned to variable u.
+  u now holds a 4-byte compressed reference 
+  (on 64-bit JVM with compressed oops enabled).
+```
+
+**What can go wrong:**
+
+- Constructor throws exception → object is allocated and zero-filled but constructor didn't complete → object is partially initialized and unreachable → becomes garbage immediately
+- Eden space full → JVM triggers minor GC before allocation → allocation pauses for 1-50ms → your P99 latency spikes
+
+---
+
+### Mechanism 2 — Reflection
+
+```java
+Class<?> clazz = Class.forName("com.example.User");
+Constructor<?> constructor = clazz.getDeclaredConstructor(String.class, int.class);
+constructor.setAccessible(true);
+Object obj = constructor.newInstance("Alice", 30);
+```
+
+**What the JVM physically does — and why it's different:**
+
+```
+Step 1: Class.forName()
+  String lookup in classloader cache.
+  If not found: file I/O to find and parse .class file.
+  Returns Class<?> object — a handle to the metadata 
+  already in Metaspace, not a copy of it.
+
+Step 2: getDeclaredConstructor()
+  Iterates constructor array in class metadata.
+  Matches parameter types by type token comparison.
+  Returns Constructor<?> wrapper object.
+
+Step 3: setAccessible(true)
+  Bypasses Java access control checks.
+  This is how Spring injects into private fields.
+  Security manager can block this — relevant for 
+  enterprise environments like your SailPoint context.
+
+Step 4: newInstance()
+  First 15 invocations: pure Java reflective invocation
+    — method call goes through reflection overhead
+    — ~100-200ns vs ~10ns for direct new
+  After 15 invocations: JVM generates accessor bytecode
+    — native bytecode generated and cached
+    — subsequent calls approach direct new performance
+  This threshold is inflation threshold — important 
+  for understanding framework startup behavior.
+```
+
+**The inflation threshold is the key long-tail insight:**
+
+Spring creates beans once at startup. Prototype beans are created repeatedly. The first 15 creations of a prototype bean via reflection are slow. After that, JVM-generated accessor code runs instead. This is why Spring Boot feels slow to start but fast once running — reflection-overhead concentrated at startup, not in request handling.
+
+**What breaks:**
+
+```java
+// This fails silently in ways new never does
+constructor.setAccessible(true);
+Object obj = constructor.newInstance(); 
+// Passes wrong number of args → InvocationTargetException wrapping 
+// the real exception — your actual error is one level deeper
+
+// The correct debugging pattern:
+try {
+    Object obj = constructor.newInstance("Alice", 30);
+} catch (InvocationTargetException e) {
+    // e.getCause() is the real exception from inside the constructor
+    // e itself is just the reflection wrapper
+    throw e.getCause(); 
+}
+```
+
+`InvocationTargetException` wrapping is the most common reflection debugging mistake. The exception you see is not the exception that happened. Always call `.getCause()`.
+
+---
+
+### Mechanism 3 — Factory Pattern
+
+```java
+public class UserFactory {
+    public static User create(String type) {
+        return switch (type) {
+            case "admin" -> new AdminUser();
+            case "guest" -> new GuestUser();
+            default -> new StandardUser();
+        };
+    }
+}
+
+User u = UserFactory.create("admin");
+```
+
+**What this is actually doing at the JVM level:**
+
+```
+No new JVM mechanism — factory is just a method 
+that calls new internally.
+
+The power is in what the CALLER sees:
+  - Caller's type is User (interface or base class)
+  - Actual object type is AdminUser, GuestUser, etc.
+  - Caller cannot call new directly — factory 
+    controls instantiation
+
+At the bytecode level:
+  - Factory method uses invokestatic
+  - Inside factory: new AdminUser() uses invokespecial
+  - Returned reference type is User (upcast implicit)
+  - When caller calls u.greet(): invokevirtual
+    looks up actual type → AdminUser → calls AdminUser.greet()
+```
+
+**The wiring insight factories enable:**
+
+```java
+// Compile time: compiler only knows u is a User
+User u = UserFactory.create("admin");
+
+// Runtime: JVM knows u points to AdminUser object
+// Method dispatch goes to AdminUser's implementation
+u.greet(); // AdminUser.greet() — not User.greet()
+```
+
+This is the factory's actual value — not encapsulation of new, but decoupling the type the caller programs against from the type that actually executes. This is the foundation for understanding why Spring's proxy mechanism works.
+
+---
+
+### Mechanism 4 — Clone
+
+```java
+class User implements Cloneable {
+    String name;
+    Address address; // another object
+    
+    @Override
+    public User clone() throws CloneNotSupportedException {
+        return (User) super.clone();
+    }
+}
+
+User original = new User("Alice", new Address("NYC"));
+User copy = original.clone();
+```
+
+**The shallow copy trap — the long-tail knowledge:**
+
+```
+super.clone() does byte-for-byte copy of the object's fields.
+
+For primitives: copies the value. Safe.
+For references: copies the reference, not the object.
+
+Result:
+  original.name → "Alice" (String, immutable — safe)
+  copy.name → same "Alice" String object (fine, immutable)
+  
+  original.address → Address object at memory location X
+  copy.address → SAME Address object at memory location X
+  
+original.address == copy.address  // TRUE
+original.address.equals(copy.address)  // TRUE
+
+copy.address.city = "LA";  // modifies ORIGINAL's address too
+```
+
+**Why this matters for object wiring:**
+
+When you wire objects by passing references (which is all Java wiring is), you're always passing shallow copies of the reference, never deep copies of the object. Two services holding a reference to the same configuration object will see each other's mutations. This is the mechanism behind the most subtle concurrency bugs in Java — not the concurrency itself, but the reference sharing that makes it possible.
+
+---
+
+### Mechanism 5 — Deserialization
+
+```java
+// Serialize
+ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream("user.ser"));
+out.writeObject(user);
+
+// Deserialize — object created WITHOUT calling constructor
+ObjectInputStream in = new ObjectInputStream(new FileInputStream("user.ser"));
+User user = (User) in.readObject();
+```
+
+**The JVM-level mechanism:**
+
+```
+Constructor is NOT called during deserialization.
+Object is created via JVM-internal allocation 
+(same memory allocation as new, but skips constructor).
+Fields are populated directly from serialized bytes.
+
+This means:
+- Validation in constructor is bypassed
+- Initialization logic in constructor is bypassed
+- final fields can be set via reflection during this process
+```
+
+**The production security implication:**
+
+This is why Java deserialization is one of the most exploited attack vectors — an attacker who controls the serialized bytes can create objects in states your constructor would never allow. For your SailPoint context: SailPoint IIQ uses Java serialization heavily in its workflow engine. Deserialization vulnerabilities in enterprise IAM systems are critical severity. Understanding WHY deserialization bypasses constructors is understanding why this attack class exists.
+
+---
+
+## I — Insert Reasoning Before Conclusion
+
+The most important reasoning question in this entire topic: **how does the JVM know which method to call when the reference type and the object type are different?**
+
+Without I, you get: "dynamic dispatch, vtable lookup." With I applied:
+
+```
+Before explaining method dispatch:
+
+Step 1: Explain the three fundamentally different 
+dispatch mechanisms as separate things with 
+different bytecode instructions, different 
+performance characteristics, and different 
+failure modes.
+
+Step 2: For each mechanism, explain what information 
+exists at compile time vs what must be resolved at 
+runtime, and why.
+
+Step 3: Explain the specific data structure the JVM 
+uses for each lookup and where it lives in memory.
+
+Step 4: Only then explain how these combine to enable 
+polymorphism.
+```
+
+**The forced reasoning produces the complete dispatch model:**
+
+---
+
+### Dispatch Mechanism 1 — invokestatic
+
+```java
+Math.sqrt(4.0);
+User.getDefaultName();
+```
+
+```
+Bytecode: invokestatic
+
+Resolved at: COMPILE TIME — fully
+Method address baked into bytecode.
+No object needed. No lookup at runtime.
+Fastest possible dispatch.
+
+Cannot be overridden — there is no object, 
+no vtable, no runtime type to check.
+
+Memory: method lives in Metaspace.
+Call: direct jump to fixed address.
+Cost: ~1ns
+```
+
+---
+
+### Dispatch Mechanism 2 — invokevirtual (the important one)
+
+```java
+User u = new AdminUser();
+u.greet(); // which greet()?
+```
+
+```
+Bytecode: invokevirtual
+
+Resolved at: RUNTIME — via vtable
+
+The vtable (virtual method table):
+  Lives in Class Metadata in Metaspace.
+  Created when class is loaded.
+  One vtable per class — shared across all instances.
+  
+  User vtable:
+    [0] → Object.hashCode()
+    [1] → Object.equals()
+    [2] → Object.toString()
+    [3] → User.greet()        ← index 3
+    [4] → User.getName()
+  
+  AdminUser vtable (extends User):
+    [0] → Object.hashCode()
+    [1] → Object.equals()
+    [2] → Object.toString()
+    [3] → AdminUser.greet()   ← SAME index 3, different target
+    [4] → User.getName()      ← inherited, same target
+    [5] → AdminUser.adminAction()  ← new method
+
+Runtime call sequence for u.greet():
+  1. Follow reference u to heap object
+  2. Read Klass Pointer from object header
+  3. Follow Klass Pointer to AdminUser's class metadata
+  4. Access AdminUser's vtable
+  5. Look up index 3 (greet's slot — fixed by compiler)
+  6. Jump to AdminUser.greet() address
+
+Key insight: the SLOT INDEX is fixed at compile time.
+The TARGET ADDRESS at that slot varies by actual type.
+This is how polymorphism works mechanically.
+
+Cost: ~2-3ns (one level of indirection vs. direct call)
+```
+
+**The JIT optimization that makes this nearly free:**
+
+When the JIT sees that `u` is always `AdminUser` at a particular call site, it replaces the vtable lookup with a direct call (inline cache). If the type changes, it falls back to vtable lookup. This is called monomorphic dispatch optimization — it's why Java's "slow virtual dispatch" concern from the 1990s is largely irrelevant on modern JVMs.
+
+---
+
+### Dispatch Mechanism 3 — invokeinterface
+
+```java
+PaymentService p = new RazorpayService();
+p.pay();
+```
+
+```
+Bytecode: invokeinterface
+
+Why different from invokevirtual?
+
+vtable works because slot indices are fixed 
+by inheritance hierarchy — every subclass of User 
+has greet() at index 3.
+
+With interfaces, a class can implement MULTIPLE 
+interfaces. The slot index cannot be fixed 
+across unrelated class hierarchies.
+
+RazorpayService implements PaymentService, Serializable
+  PaymentService.pay() might be at different slot 
+  in different implementing classes.
+
+Solution: itable (interface table)
+  Each class has an itable alongside its vtable.
+  itable maps interface + method → implementing method.
+  
+  RazorpayService itable:
+    PaymentService → { pay() → RazorpayService.pay() }
+    Serializable   → { writeObject() → ... }
+
+Runtime call for p.pay():
+  1. Follow reference to RazorpayService object
+  2. Read Klass Pointer
+  3. Search itable for PaymentService entry
+  4. Find pay() in that entry
+  5. Execute
+
+Cost: ~3-5ns — slightly more than invokevirtual 
+because itable search vs. direct index access.
+Also JIT-optimized when type is stable.
+```
+
+**invokespecial — constructors and private methods:**
+
+```java
+new User(); // constructor
+super.greet(); // explicit superclass call
+```
+
+```
+Bytecode: invokespecial
+
+Used for: constructors, private methods, super calls.
+
+Why special? These must NOT be overridden by vtable lookup.
+  - new User() must call User's constructor, not a subclass's
+  - super.greet() must call User.greet(), not AdminUser.greet()
+  - private methods are invisible to subclasses
+
+Resolved at: COMPILE TIME for target class,
+but still needs the object reference for 'this'.
+
+Cost: same as invokestatic effectively.
+```
+
+---
+
+## Now — How Objects Wire Together
+
+With the creation and dispatch model in place, object wiring is the mechanism of connecting the reference chain deliberately.
+
+**Three wiring levels — each one a distinct mechanism:**
+
+---
+
+### Level 1 — Compile-Time Wiring (Direct Instantiation)
+
+```java
+class OrderService {
+    private PaymentService paymentService = new RazorpayService();
+    
+    void placeOrder() {
+        paymentService.pay();
+    }
+}
+```
+
+**What the JVM is doing:**
+
+```
+Heap state after new OrderService():
+
+Metaspace:
+  OrderService.class → vtable → [placeOrder() → ...]
+  RazorpayService.class → vtable → [pay() → ...]
+
+Heap:
+  OrderService object:
+    [header: 16 bytes                    ]
+    [paymentService: 4 bytes] → ─────────────┐
+                                             ↓
+  RazorpayService object:                    │
+    [header: 16 bytes       ] ←─────────────┘
+    [apiKey: 4 bytes        ] → String object
+
+Stack (during placeOrder()):
+  Frame: OrderService.placeOrder
+    local[0] = this → OrderService object
+    
+  Calls paymentService.pay():
+    Follow this.paymentService reference → RazorpayService object
+    Read Klass Pointer → RazorpayService metadata
+    invokevirtual → vtable lookup → RazorpayService.pay()
+    New frame pushed: RazorpayService.pay()
+```
+
+**The coupling problem this creates:**
+
+`OrderService.class` bytecode contains a direct reference to `RazorpayService` class literal. To change the payment provider, you recompile OrderService. The wiring is in the bytecode — fixed at compile time.
+
+---
+
+### Level 2 — Runtime Wiring (Dependency Injection by Hand)
+
+```java
+class OrderService {
+    private final PaymentService paymentService; // interface type
+    
+    OrderService(PaymentService paymentService) { // injected
+        this.paymentService = paymentService;
+    }
+}
+
+// Wiring happens here, at the composition root
+PaymentService payment = new RazorpayService();
+OrderService orders = new OrderService(payment);
+```
+
+**What changed at the bytecode level:**
+
+```
+OrderService.class bytecode now contains:
+  - Reference to PaymentService INTERFACE type
+  - NO reference to RazorpayService class
+  
+  When orders.placeOrder() calls paymentService.pay():
+    - Bytecode uses invokeinterface (not invokevirtual)
+    - JVM resolves via itable at runtime
+    - Finds RazorpayService.pay() because that's what 
+      was injected at this specific runtime
+    
+  Swap to StripeService:
+    StripeService stripe = new StripeService();
+    OrderService orders = new OrderService(stripe);
+    // OrderService.class bytecode UNCHANGED
+    // Only the reference in the object changed
+```
+
+**The heap view of correct constructor injection:**
+
+```
+Before injection:
+  orders object: [header][paymentService: null]
+  payment object: [header][apiKey: ...][endpoint: ...]
+
+Constructor call: new OrderService(payment)
+  - Stack frame created
+  - 'payment' reference passed as parameter
+  - Inside constructor: this.paymentService = paymentService
+    copies the REFERENCE (4 bytes) into orders object's field
+
+After injection:
+  orders object: [header][paymentService: ──────────────┐]
+  payment object: [header][apiKey: ...][endpoint: ...] ←┘
+  
+  Both objects exist on heap independently.
+  OrderService holds a 4-byte reference to PaymentService object.
+  PaymentService object has no knowledge of OrderService.
+  Wiring is ONE-DIRECTIONAL at the reference level.
+```
+
+---
+
+### Level 3 — Framework-Managed Wiring (Spring IoC)
+
+This is where everything converges. Spring is a machine that automates Level 2 wiring using reflection-based object creation.
+
+**What Spring actually does — mechanically:**
+
+```
+Phase 1: Classpath Scanning (startup)
+  Spring scans all .class files in configured packages.
+  For each class annotated with @Component, @Service, etc.:
+    - Reads class metadata via reflection
+    - Inspects constructors: getDeclaredConstructors()
+    - Inspects fields: getDeclaredFields()
+    - Inspects methods: getDeclaredMethods()
+    - Builds a BeanDefinition object describing how to create it
+
+Phase 2: Dependency Graph Construction
+  For each BeanDefinition, Spring identifies dependencies:
+    - Constructor parameters → required dependencies
+    - @Autowired fields → required dependencies  
+    - @Autowired methods → required dependencies
+  
+  Builds directed graph:
+    OrderService → PaymentService
+    OrderService → InventoryService
+    PaymentService → (no dependencies)
+    InventoryService → DatabaseService
+  
+  Topological sort of graph gives creation order:
+    DatabaseService → InventoryService → PaymentService → OrderService
+
+Phase 3: Bean Creation (in topological order)
+  For each bean in sorted order:
+  
+    1. Instantiate via reflection:
+       Constructor<?> c = clazz.getDeclaredConstructor(deps...);
+       c.setAccessible(true);
+       Object bean = c.newInstance(resolvedDependencies...);
+    
+    2. Populate @Autowired fields:
+       Field f = clazz.getDeclaredField("paymentService");
+       f.setAccessible(true);
+       f.set(bean, resolvedPaymentServiceBean);
+    
+    3. Call @PostConstruct methods:
+       Method init = clazz.getDeclaredMethod("init");
+       init.invoke(bean);
+    
+    4. Wrap in proxy if needed:
+       (@Transactional, @Cacheable, @Async, etc.)
+       bean = proxyFactory.createProxy(bean);
+    
+    5. Store in singletonObjects map:
+       singletonObjects.put("orderService", bean);
+
+Phase 4: Runtime Request
+  When code calls orderService.placeOrder():
+    - orderService reference points to PROXY object, not OrderService
+    - Proxy intercepts the call
+    - Runs @Transactional logic (begin transaction)
+    - Delegates to real OrderService.placeOrder()
+    - Runs post-method logic (commit/rollback transaction)
+    - Returns result
+```
+
+**The proxy object — what it actually is:**
+
+```java
+// Your class
+@Service
+@Transactional
+class OrderService {
+    void placeOrder() { /* your code */ }
+}
+
+// What Spring actually puts in the container (CGLIB-generated):
+class OrderService$$SpringCGLIB$$0 extends OrderService {
+    
+    private OrderService realInstance; // your actual object
+    
+    @Override
+    void placeOrder() {
+        // Spring's transaction management code
+        TransactionStatus tx = transactionManager.beginTransaction();
+        try {
+            realInstance.placeOrder(); // delegates to your code
+            transactionManager.commit(tx);
+        } catch (Exception e) {
+            transactionManager.rollback(tx);
+            throw e;
+        }
+    }
+}
+```
+
+**The production implication:**
+
+When you call `orderService.placeOrder()` from outside the class, it goes through the proxy — transactions work. When `OrderService` calls its own method `this.helperMethod()` internally, `this` is the real object, not the proxy — `@Transactional` on `helperMethod()` is silently bypassed. This is the most common Spring transaction bug in production, and it's invisible without understanding the proxy mechanism.
+
+---
+
+## V — Verify the Critical Claims
+
+**Verification 1 — See the bytecode yourself:**
+
+```bash
+# Compile your class
+javac User.java
+
+# Disassemble — see the actual JVM instructions
+javap -c -verbose User.class
+```
+
+Look for `invokevirtual`, `invokeinterface`, `invokespecial`, `invokestatic`. Every method call in your Java code maps to one of these four instructions. Once you can read a `javap` output, you can verify any claim about method dispatch directly.
+
+**Verification 2 — See heap layout yourself:**
+
+```xml
+<!-- Add to pom.xml -->
+<dependency>
+    <groupId>org.openjdk.jol</groupId>
+    <artifactId>jol-core</artifactId>
+    <version>0.17</version>
+</dependency>
+```
+
+```java
+import org.openjdk.jol.info.ClassLayout;
+
+System.out.println(ClassLayout.parseInstance(new User()).toPrintable());
+```
+
+Output shows exact byte layout of any object. Every claim about object headers, field ordering, and padding is verifiable with this tool in 30 seconds.
+
+**Verification 3 — See Spring's bean graph:**
+
+```java
+// In any Spring Boot app
+@Autowired
+ApplicationContext context;
+
+// List all beans and their dependencies
+String[] beans = context.getBeanDefinitionNames();
+// Use actuator: GET /actuator/beans for full dependency graph
+```
+
+**Verification 4 — The adversarial probe:**
+
+```
+You are a senior JVM engineer who thinks 
+understanding vtables and itables is unnecessary 
+for production Java development.
+
+Make the strongest case that this level of 
+internals knowledge provides no practical value 
+and that a developer who just knows "polymorphism 
+works" can build production systems without it.
+
+Then tell me the specific production scenario 
+where that shallow knowledge causes an incident 
+they cannot diagnose.
+```
+
+**The adversarial case holds for 90% of scenarios.** Then it fails here: the Spring `@Transactional` self-invocation bug described above. Without understanding that the proxy is a subclass wrapping the real instance, and that `this` inside a method bypasses the proxy, you cannot diagnose why transactions aren't working when the code looks correct. That bug is common enough that it's in Spring's official documentation warnings — and engineers hit it repeatedly because they don't have the proxy mental model.
+
+---
+
+## E — Expand Iteratively
+
+**Round 1 output** — the map you now hold:
+
+```
+Object Creation:
+  new → bump-pointer allocation + constructor
+  reflection → metadata lookup + inflation threshold
+  factory → controlled new with type hiding  
+  clone → byte-copy with shallow reference trap
+  deserialization → allocation bypassing constructor
+
+Method Dispatch:
+  invokestatic → compile-time, direct address
+  invokespecial → compile-time target, runtime object
+  invokevirtual → runtime vtable lookup by slot index
+  invokeinterface → runtime itable search
+
+Object Wiring:
+  compile-time → bytecode contains class literal
+  runtime manual → reference passed as parameter
+  framework → reflection + dependency graph + proxy wrapping
+```
+
+**Round 2 — Push on the most interesting claim:**
+
+```
+You described CGLIB proxies as Spring's mechanism 
+for @Transactional.
+
+When does Spring use JDK dynamic proxy instead of CGLIB?
+What is the mechanical difference between them at the 
+bytecode level?
+What breaks when Spring chooses the wrong one for 
+your situation, and how would you diagnose it?
+```
+
+**Round 2 produces:**
+
+JDK dynamic proxy requires the bean to implement an interface — it creates a proxy that implements the same interface. CGLIB subclasses the concrete class — no interface needed. Spring's choice depends on whether the bean implements an interface and on `proxyTargetClass` configuration. The failure mode: you have a `@Service` class without an interface, Spring uses CGLIB, but your class is `final` — CGLIB cannot subclass a final class, Spring throws `Cannot subclass final class` at startup. Or subtler: CGLIB proxies cannot proxy `final` methods — they're silently not intercepted. `@Transactional` on a `final` method is silently ignored.
+
+**Round 3 — Your IoC container specifically:**
+
+```
+I am implementing a mini IoC container.
+I can now create objects via reflection and 
+do topological sort for dependency ordering.
+
+What is the minimum implementation of the 
+proxy mechanism I need to intercept method 
+calls on beans — equivalent to what Spring 
+does for @Transactional?
+
+Give me the core implementation using only 
+java.lang.reflect.Proxy, no CGLIB.
+```
+
+**Round 3 produces the implementation:**
+
+```java
+public class TransactionProxy implements InvocationHandler {
+    
+    private final Object realBean;
+    private final TransactionManager txManager;
+    
+    public TransactionProxy(Object realBean, TransactionManager txManager) {
+        this.realBean = realBean;
+        this.txManager = txManager;
+    }
+    
+    @Override
+    public Object invoke(Object proxy, Method method, Object[] args) 
+            throws Throwable {
+        
+        // Check if method needs transaction
+        boolean transactional = method.isAnnotationPresent(Transactional.class)
+            || realBean.getClass().isAnnotationPresent(Transactional.class);
+        
+        if (!transactional) {
+            return method.invoke(realBean, args); // pass through
+        }
+        
+        // Transactional method — wrap with tx logic
+        txManager.begin();
+        try {
+            Object result = method.invoke(realBean, args);
+            txManager.commit();
+            return result;
+        } catch (InvocationTargetException e) {
+            txManager.rollback();
+            throw e.getCause(); // unwrap — same pattern as before
+        }
+    }
+    
+    // Factory method — creates the proxy
+    @SuppressWarnings("unchecked")
+    public static <T> T wrap(T bean, TransactionManager txManager, 
+                              Class<?>... interfaces) {
+        return (T) Proxy.newProxyInstance(
+            bean.getClass().getClassLoader(),
+            interfaces,     // bean must implement these
+            new TransactionProxy(bean, txManager)
+        );
+    }
+}
+
+// Usage in your IoC container:
+PaymentService realService = new RazorpayService();
+PaymentService proxied = TransactionProxy.wrap(
+    realService, 
+    txManager,
+    PaymentService.class  // interface — JDK proxy requirement
+);
+
+// proxied.pay() → InvocationHandler.invoke() → txManager.begin() 
+//              → realService.pay() → txManager.commit()
+```
+
+**Round 4 — The unknown unknown:**
+
+```
+We've covered creation mechanisms, dispatch 
+mechanisms, wiring levels, and proxy patterns.
+
+What is the one thing about how Java objects 
+are created and wired in production systems 
+that consistently surprises developers who 
+think they understand this topic completely?
+```
+
+**What surfaces:**
+
+Object identity vs. object equality in a wired system — and how proxies break it.
+
+```java
+@Autowired
+OrderService orderService1;
+
+@Autowired  
+OrderService orderService2;
+
+// Both are singletons — same bean, right?
+orderService1 == orderService2; // TRUE — same proxy object
+
+// But:
+orderService1 == AopUtils.getTargetObject(orderService1); // FALSE
+// The proxy is not the real object
+// If you ever compare with ==, you might be comparing proxies
+// If your equals() uses == internally (identity), proxy injection 
+// can silently break equality checks in collections
+
+// The specific production bug:
+Set<OrderService> serviceSet = new HashSet<>();
+serviceSet.add(orderService1);
+serviceSet.contains(orderService2); // depends on hashCode/equals impl
+// If hashCode is from Object (identity-based), 
+// proxy and real object have DIFFERENT hash codes
+// even though they represent the same logical bean
+```
+
+This is not theoretical. Any system that puts Spring beans in collections and relies on identity-based equality — which is the default — has this bug latent. It manifests as "service not found in set" errors that are nearly impossible to diagnose without knowing proxies are involved.
+
+---
+
+## The Complete Mental Model
+
+Everything you asked about reduces to one chain with three operations:
+
+```
+CREATION:  Reference ← [new/reflection/factory/clone/deserialization] → Heap Object
+                                                                              ↓
+DISPATCH:  method call → [invokestatic/special/virtual/interface] → Klass Pointer
+                                                                              ↓
+WIRING:    Object A.fieldRef → [manual/constructor/Spring] → Object B on Heap
+```
+
+Spring is a machine that automates the third operation — using the second operation (reflection = invokeinterface on Method objects) to build the first operation (object creation) in the right order, then wraps the result in objects that intercept the second operation (proxies) to add cross-cutting behavior.
+
+Every Spring concept you'll encounter — bean scopes, lazy initialization, circular dependencies, AOP, transaction management — is a variation on one of these three operations. With this model, you don't need to memorize how each Spring feature works. You can derive it.
+
+-------
+
 Good project choice. Spring Boot and Go have genuinely complementary strengths — this isn't "use both because you can," there's a real architectural logic to it. But before the DERIVE application, you need the foundation that makes the framework useful here.
 
 ---
