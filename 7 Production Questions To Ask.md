@@ -5580,4 +5580,1061 @@ Weeks 31-54: Incident simulation across all 9
 After 54 weeks you haven't memorized patterns. You've internalized the failure modes. That's the difference between passing an interview and surviving an incident at 3am.
 
 
+--------
+
+The document adds the keystone invariant correctly. Before building it out, lock in why it's the meta-invariant and not just the 10th item on a list.
+
+---
+
+## What Actually Changed
+
+```
+Previous 9 invariants: properties of the system
+Invariant 10:          property of the human-system interface
+
+The difference:
+You can protect all 9 invariants perfectly in code.
+If humans cannot understand, diagnose, or safely change 
+the system under pressure — the 9 invariants don't matter.
+They'll be violated during the repair attempt.
+
+Operability is not a 10th invariant.
+It's the invariant that protects the other 9
+when they fail at 3am.
+```
+
+The document's framing is exactly right:
+
+```
+Automatic recovery handles 80% of failures.
+The 20% it doesn't handle are the expensive ones.
+The 20% requires humans.
+If humans can't operate the system — you've protected
+the easy 80% and left the expensive 20% unprotected.
+```
+
+---
+
+## D — Destroy The Default Path
+
+```
+I am not asking for a theoretical treatment 
+of operability.
+
+I am asking for the complete operability layer 
+for the systems we've already built — the mini 
+IoC container, the order saga, the Go API gateway,
+the Spring Boot e-commerce backend.
+
+For each system:
+- The admin interface a human uses at 3am
+- The kill switch that stops the bleeding
+- The runbook that tells them what to do
+- The audit trail that tells them what happened
+- The rollback mechanism that undoes what broke it
+
+Not described. Implemented.
+The code that makes the system operable,
+not the code that makes it correct.
+```
+
+---
+
+## E — Eliminate The Assumptions
+
+```
+Do NOT assume operability means better logging.
+Logging is observability. Operability is control.
+Show the difference: observability tells you 
+what is broken. Operability lets you fix it 
+without writing new code or deploying.
+
+Do NOT assume admin endpoints are a security risk 
+that should be avoided. Show how to secure them 
+correctly — authenticated, authorized, audited —
+so the risk argument fails.
+
+Do NOT assume automatic recovery is sufficient.
+Show specifically what automatic recovery cannot 
+handle and why those cases are the expensive ones.
+
+Do NOT assume "operable" means "simple."
+Complex systems can be operable.
+Simple systems can be inoperable.
+Show what makes the difference.
+
+Do NOT collapse operability into observability.
+They are related but distinct:
+Observability: can you see what's happening?
+Operability: can you change what's happening?
+Both are necessary. Neither substitutes for the other.
+```
+
+---
+
+## R — Reach The Long Tail
+
+```
+You are a staff engineer who has run postmortems 
+on 50+ production incidents across your career.
+
+From that experience:
+What percentage of incidents required human 
+intervention that no automated system could handle?
+
+What is the most common reason an incident 
+that should have taken 15 minutes to fix 
+took 4 hours?
+
+What is the one capability — not a monitoring 
+tool, not a deployment tool — that, once your 
+team had it, most reduced your mean time to 
+recovery?
+
+What does an inoperable system look like from 
+the outside — the symptoms that tell you before 
+an incident that you're going to have a bad night?
+```
+
+**What surfaces from the long tail:**
+
+The most common reason a 15-minute fix takes 4 hours: **the engineer cannot safely change production state without writing and deploying new code.** The bug is understood in 15 minutes. The fix requires a deploy. The deploy requires approval. The approval requires waking someone up. By the time the fix is deployed: 4 hours have passed.
+
+The one capability that most reduces MTTR: **runtime state mutation without deployment.** Feature flags, circuit breaker manual override, connection pool resize, rate limit adjustment — any of these that can be changed at runtime without a deploy collapses incident timelines from hours to minutes.
+
+The symptom of an inoperable system: **engineers are afraid to make changes.** Not because the changes are risky — because they can't undo them fast enough if something goes wrong. Fear of deployment is the leading indicator of inoperability.
+
+---
+
+## I — Insert Reasoning Before The Build
+
+**The operability design questions that must be answered before building:**
+
+```
+For every system component, answer these before writing code:
+
+Question 1: If this component enters a bad state, 
+            how does a human detect it?
+            (not a monitor — a human, at 3am, looking at a dashboard)
+
+Question 2: If this component enters a bad state,
+            what is the first action a human takes?
+            (not the system — a human, under pressure, 
+            who may not have written this code)
+
+Question 3: If that action makes things worse,
+            how does the human undo it in under 5 minutes?
+            (the rollback path — not the deploy path)
+
+Question 4: After the incident, how does anyone know
+            what happened, who did what, and in what order?
+            (the audit trail — separate from application logs)
+
+If you cannot answer all four before building:
+You are building a system that will eventually 
+require 4-hour incidents to repair.
+```
+
+---
+
+## The Complete Operability Layer
+
+Built on top of everything previously constructed. Not replacing it — layering on top.
+
+---
+
+### Layer 1: System State Visibility
+
+The first operability requirement: a human can understand the current state of the system without reading logs or writing queries.
+
+**Java/Spring — the system state dashboard endpoint:**
+
+```java
+// A single endpoint that gives complete system state to an operator
+// Not metrics — state. What is the system doing right now?
+
+@RestController
+@RequestMapping("/admin/system")
+@PreAuthorize("hasRole('ADMIN')")
+public class SystemStateController {
+    
+    @Autowired private OrderSagaRepository sagaRepo;
+    @Autowired private HikariDataSource dataSource;
+    @Autowired private CircuitBreakerRegistry circuitBreakers;
+    @Autowired private FeatureFlagService flags;
+    
+    @GetMapping("/state")
+    public SystemState getSystemState() {
+        return SystemState.builder()
+            
+            // Saga health — what's stuck?
+            .sagaState(SagaHealth.builder()
+                .pendingCount(sagaRepo.countByStatus(PENDING))
+                .stuckCount(sagaRepo.countStuckOver(Duration.ofHours(1)))
+                .failedCompensationCount(sagaRepo.countFailedCompensations())
+                .oldestStuckAgeMinutes(sagaRepo.oldestStuckAgeMinutes())
+                .build())
+            
+            // Connection pool — are we near exhaustion?
+            .connectionPool(PoolHealth.builder()
+                .activeConnections(dataSource.getHikariPoolMXBean().getActiveConnections())
+                .idleConnections(dataSource.getHikariPoolMXBean().getIdleConnections())
+                .pendingThreads(dataSource.getHikariPoolMXBean().getThreadsAwaitingConnection())
+                .maxPoolSize(dataSource.getMaximumPoolSize())
+                .utilizationPct(calculateUtilization(dataSource))
+                .build())
+            
+            // Circuit breakers — what's currently open?
+            .circuitBreakers(circuitBreakers.getAllCircuitBreakers().stream()
+                .map(cb -> CircuitBreakerState.builder()
+                    .name(cb.getName())
+                    .state(cb.getState().name()) // CLOSED/OPEN/HALF_OPEN
+                    .failureRate(cb.getMetrics().getFailureRate())
+                    .callsInLastMinute(cb.getMetrics().getNumberOfBufferedCalls())
+                    .build())
+                .collect(Collectors.toList()))
+            
+            // Feature flags — what's disabled?
+            .featureFlags(flags.getAllFlags().stream()
+                .filter(f -> !f.isEnabled()) // show only disabled flags
+                .map(f -> DisabledFlag.builder()
+                    .name(f.getName())
+                    .disabledBy(f.getUpdatedBy())
+                    .disabledAt(f.getUpdatedAt())
+                    .reason(f.getDisableReason())
+                    .build())
+                .collect(Collectors.toList()))
+            
+            // Clock — operator can verify state freshness
+            .asOf(Instant.now())
+            .build();
+    }
+}
+```
+
+**Response at 3am — what the operator sees:**
+
+```json
+{
+  "sagaState": {
+    "pendingCount": 847,
+    "stuckCount": 847,
+    "failedCompensationCount": 847,
+    "oldestStuckAgeMinutes": 180
+  },
+  "connectionPool": {
+    "activeConnections": 18,
+    "idleConnections": 2,
+    "pendingThreads": 47,
+    "maxPoolSize": 20,
+    "utilizationPct": 90
+  },
+  "circuitBreakers": [
+    {
+      "name": "inventory-service",
+      "state": "OPEN",
+      "failureRate": 100.0,
+      "callsInLastMinute": 0
+    }
+  ],
+  "featureFlags": [],
+  "asOf": "2024-01-15T03:14:22Z"
+}
+```
+
+One API call. The operator now knows:
+- 847 sagas stuck for 3 hours
+- Connection pool at 90% — about to exhaust
+- Inventory service circuit breaker is open — that's why sagas are stuck
+- No feature flags disabled — the problem is infrastructure, not a toggle
+
+**Diagnosis time: 2 minutes, not 2 hours.**
+
+---
+
+### Layer 2: Runtime Control — Changing System Behavior Without Deploy
+
+**Java/Spring — the control plane:**
+
+```java
+// Every operational parameter: runtime-configurable
+@RestController
+@RequestMapping("/admin/control")
+@PreAuthorize("hasRole('ADMIN')")
+public class ControlPlaneController {
+    
+    // ── Connection Pool ────────────────────────────────────────
+    
+    @PostMapping("/pool/resize")
+    public PoolResizeResult resizeConnectionPool(
+            @RequestBody @Valid PoolResizeRequest req,
+            @AuthenticationPrincipal String operatorId) {
+        
+        validateSafeRange(req.getNewSize(), 5, 100);
+        
+        int oldSize = dataSource.getMaximumPoolSize();
+        dataSource.setMaximumPoolSize(req.getNewSize());
+        
+        auditLog.record(AuditEvent.builder()
+            .action("POOL_RESIZE")
+            .operator(operatorId)
+            .before(Map.of("size", oldSize))
+            .after(Map.of("size", req.getNewSize()))
+            .reason(req.getReason())
+            .timestamp(Instant.now())
+            .build());
+        
+        return new PoolResizeResult(oldSize, req.getNewSize());
+        // No deploy. No restart. Immediate effect.
+    }
+    
+    // ── Circuit Breaker ────────────────────────────────────────
+    
+    @PostMapping("/circuit/{name}/force-open")
+    public CircuitBreakerResult forceOpenCircuit(
+            @PathVariable String name,
+            @RequestBody ForcedOpenReason reason,
+            @AuthenticationPrincipal String operatorId) {
+        
+        // Use when dependency is known-down — skip timeout wait
+        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker(name);
+        cb.transitionToForcedOpenState();
+        
+        auditLog.record(AuditEvent.builder()
+            .action("CIRCUIT_FORCED_OPEN")
+            .operator(operatorId)
+            .target(name)
+            .reason(reason.getText())
+            .timestamp(Instant.now())
+            .build());
+        
+        log.warn("Circuit breaker force-opened by operator",
+            "circuit", name,
+            "operator", operatorId,
+            "reason", reason.getText());
+        
+        return new CircuitBreakerResult(name, "FORCED_OPEN");
+    }
+    
+    @PostMapping("/circuit/{name}/reset")
+    public CircuitBreakerResult resetCircuit(
+            @PathVariable String name,
+            @AuthenticationPrincipal String operatorId) {
+        
+        CircuitBreaker cb = circuitBreakerRegistry.circuitBreaker(name);
+        cb.transitionToClosedState();
+        
+        auditLog.record(AuditEvent.builder()
+            .action("CIRCUIT_RESET")
+            .operator(operatorId)
+            .target(name)
+            .timestamp(Instant.now())
+            .build());
+        
+        return new CircuitBreakerResult(name, "CLOSED");
+    }
+    
+    // ── Feature Flags ──────────────────────────────────────────
+    
+    @PostMapping("/flags/{name}/disable")
+    public FeatureFlagResult disableFlag(
+            @PathVariable String name,
+            @RequestBody @Valid DisableFlagRequest req,
+            @AuthenticationPrincipal String operatorId) {
+        
+        // Requires reason — prevents careless toggles
+        if (req.getReason() == null || req.getReason().isBlank()) {
+            throw new ValidationException("Disable reason is required");
+        }
+        
+        FeatureFlag flag = flags.disable(name, operatorId, req.getReason());
+        
+        auditLog.record(AuditEvent.builder()
+            .action("FLAG_DISABLED")
+            .operator(operatorId)
+            .target(name)
+            .reason(req.getReason())
+            .timestamp(Instant.now())
+            .build());
+        
+        return new FeatureFlagResult(flag);
+    }
+    
+    // ── Rate Limiting ──────────────────────────────────────────
+    
+    @PostMapping("/rate-limit/{endpoint}")
+    public RateLimitResult adjustRateLimit(
+            @PathVariable String endpoint,
+            @RequestBody RateLimitAdjustment adjustment,
+            @AuthenticationPrincipal String operatorId) {
+        
+        int oldLimit = rateLimiter.getLimit(endpoint);
+        rateLimiter.setLimit(endpoint, adjustment.getNewLimit());
+        
+        auditLog.record(AuditEvent.builder()
+            .action("RATE_LIMIT_ADJUSTED")
+            .operator(operatorId)
+            .target(endpoint)
+            .before(Map.of("limit", oldLimit))
+            .after(Map.of("limit", adjustment.getNewLimit()))
+            .reason(adjustment.getReason())
+            .timestamp(Instant.now())
+            .build());
+        
+        return new RateLimitResult(endpoint, oldLimit, adjustment.getNewLimit());
+    }
+}
+```
+
+**Go — the same control plane:**
+
+```go
+// Runtime-configurable operational parameters
+type ControlPlane struct {
+    pool       *pgxpool.Pool
+    breakers   map[string]*gobreaker.CircuitBreaker
+    flags      *FeatureFlagStore
+    rateLimits *RateLimitStore
+    audit      *AuditLogger
+}
+
+func (c *ControlPlane) RegisterRoutes(r *mux.Router) {
+    admin := r.PathPrefix("/admin/control").Subrouter()
+    admin.Use(RequireRole("admin"))
+    admin.Use(RequireAuditContext) // ensure operator ID in context
+    
+    admin.HandleFunc("/pool/resize", c.handlePoolResize).Methods("POST")
+    admin.HandleFunc("/circuit/{name}/open", c.handleForceOpenCircuit).Methods("POST")
+    admin.HandleFunc("/circuit/{name}/reset", c.handleResetCircuit).Methods("POST")
+    admin.HandleFunc("/flags/{name}/disable", c.handleDisableFlag).Methods("POST")
+    admin.HandleFunc("/rate-limit/{endpoint}", c.handleAdjustRateLimit).Methods("POST")
+}
+
+func (c *ControlPlane) handlePoolResize(w http.ResponseWriter, r *http.Request) {
+    var req struct {
+        NewSize int    `json:"new_size"`
+        Reason  string `json:"reason"`
+    }
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, "invalid request", http.StatusBadRequest)
+        return
+    }
+    
+    if req.NewSize < 5 || req.NewSize > 100 {
+        http.Error(w, "pool size must be between 5 and 100", 
+            http.StatusBadRequest)
+        return
+    }
+    
+    operatorID := r.Context().Value(operatorIDKey).(string)
+    oldSize := c.pool.Config().MaxConns
+    
+    // pgxpool doesn't support runtime resize — 
+    // this is where you'd use a wrapper that does
+    // or document this as a limitation
+    c.pool.Config().MaxConns = int32(req.NewSize)
+    
+    c.audit.Record(r.Context(), AuditEvent{
+        Action:    "POOL_RESIZE",
+        Operator:  operatorID,
+        Before:    map[string]any{"size": oldSize},
+        After:     map[string]any{"size": req.NewSize},
+        Reason:    req.Reason,
+        Timestamp: time.Now(),
+    })
+    
+    slog.Warn("connection pool resized by operator",
+        "operator", operatorID,
+        "from", oldSize,
+        "to", req.NewSize,
+        "reason", req.Reason,
+    )
+    
+    json.NewEncoder(w).Encode(map[string]any{
+        "old_size": oldSize,
+        "new_size": req.NewSize,
+    })
+}
+```
+
+---
+
+### Layer 3: The Audit Trail — What Happened, Who Did It, In What Order
+
+The audit trail is separate from application logs. Application logs answer "what did the system do?" Audit logs answer "what did humans do to the system?"
+
+```java
+// Audit event — immutable, append-only
+@Entity
+@Table(name = "audit_log")
+@Immutable // Hibernate annotation — no updates ever
+public class AuditEvent {
+    
+    @Id
+    @GeneratedValue
+    private Long id;
+    
+    private String action;      // POOL_RESIZE, FLAG_DISABLED, SAGA_MANUALLY_COMPENSATED
+    private String operator;    // who did it
+    private String target;      // what they did it to
+    
+    @Column(columnDefinition = "JSONB")
+    private String before;      // state before action
+    
+    @Column(columnDefinition = "JSONB")
+    private String after;       // state after action
+    
+    private String reason;      // required — why did they do it
+    
+    private Instant timestamp;
+    private String requestId;   // links to application log if needed
+    private String sessionId;   // all actions in an incident response session
+    
+    // No setters. No updates. Append-only by design.
+}
+
+// Audit query — what happened during the incident?
+@Repository
+public interface AuditRepository extends JpaRepository<AuditEvent, Long> {
+    
+    // Timeline reconstruction: what happened between T1 and T2?
+    List<AuditEvent> findByTimestampBetweenOrderByTimestampAsc(
+        Instant start, Instant end
+    );
+    
+    // Operator activity: what did this person do?
+    List<AuditEvent> findByOperatorOrderByTimestampDesc(String operator);
+    
+    // Target history: what's been done to this resource?
+    List<AuditEvent> findByTargetOrderByTimestampDesc(String target);
+}
+
+// Admin endpoint — postmortem investigation
+@GetMapping("/admin/audit")
+@PreAuthorize("hasRole('ADMIN')")
+public List<AuditEvent> getAuditTimeline(
+        @RequestParam @DateTimeFormat(iso = ISO.DATE_TIME) Instant from,
+        @RequestParam @DateTimeFormat(iso = ISO.DATE_TIME) Instant to) {
+    
+    return auditRepo.findByTimestampBetweenOrderByTimestampAsc(from, to);
+}
+```
+
+**Go — append-only audit log:**
+
+```go
+type AuditEvent struct {
+    ID        int64          `db:"id"`
+    Action    string         `db:"action"`
+    Operator  string         `db:"operator"`
+    Target    string         `db:"target"`
+    Before    json.RawMessage `db:"before"`
+    After     json.RawMessage `db:"after"`
+    Reason    string         `db:"reason"`
+    Timestamp time.Time      `db:"timestamp"`
+    RequestID string         `db:"request_id"`
+}
+
+type AuditLogger struct {
+    db *pgxpool.Pool
+}
+
+func (a *AuditLogger) Record(ctx context.Context, event AuditEvent) {
+    event.Timestamp = time.Now()
+    event.RequestID, _ = ctx.Value(requestIDKey).(string)
+    
+    // Fire and forget with timeout — audit must not block operations
+    auditCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    _, err := a.db.Exec(auditCtx,
+        `INSERT INTO audit_log 
+         (action, operator, target, before_state, after_state, reason, timestamp, request_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        event.Action, event.Operator, event.Target,
+        event.Before, event.After, event.Reason,
+        event.Timestamp, event.RequestID,
+    )
+    if err != nil {
+        // Log but don't fail — audit failure must not block operation
+        slog.Error("audit log write failed",
+            "action", event.Action,
+            "operator", event.Operator,
+            "error", err,
+        )
+    }
+}
+```
+
+---
+
+### Layer 4: The Runbook — Human Interface Under Pressure
+
+A runbook is not documentation. Documentation explains. A runbook decides.
+
+```markdown
+# Runbook: Order Saga Stuck
+
+## When This Fires
+Alert: `saga_stuck_count > 10` for 15 minutes
+Alert: `saga_compensation_failure_rate > 5%`
+Alert: Paged by: on-call rotation
+
+## First 2 Minutes: Understand Scope
+
+```bash
+# What is the current system state?
+curl -s https://admin.internal/admin/system/state | jq .
+
+# How many sagas stuck and for how long?
+curl -s "https://admin.internal/admin/sagas/stuck?hours=24" \
+  | jq '{ count: length, oldest: (.[].created_at | min) }'
+```
+
+**Decision point:**
+- stuck_count < 10: investigate but no immediate action
+- stuck_count 10-100: proceed to Step 2
+- stuck_count > 100: escalate to platform team AND proceed
+
+## Step 2: Find The Root Cause (5 Minutes)
+
+```bash
+# What errors are the stuck sagas showing?
+curl -s "https://admin.internal/admin/sagas/stuck?hours=4" \
+  | jq '[.[].error_log] | flatten | group_by(.) | map({error: .[0], count: length})'
+
+# Check circuit breakers — is a dependency down?
+curl -s "https://admin.internal/admin/system/state" \
+  | jq '.circuit_breakers[] | select(.state != "CLOSED")'
+
+# Check recent deploys — did something change?
+curl -s "https://deploy.internal/api/recent?hours=4"
+```
+
+**Decision matrix:**
+
+| What you see | What it means | Action |
+|---|---|---|
+| Circuit breaker OPEN for inventory | Inventory service is down | Go to Step 3A |
+| Circuit breaker CLOSED, errors are timeouts | Inventory service is slow | Go to Step 3B |
+| Circuit breaker CLOSED, no errors visible | Compensation logic bug | Go to Step 3C |
+| Recent deploy in last 4 hours | Deploy may have caused it | Go to Step 3D |
+
+## Step 3A: Dependency Down — Wait and Monitor
+
+```bash
+# Check inventory service health directly
+curl -s https://inventory.internal/health | jq .
+
+# If inventory is down: sagas will auto-retry when it recovers
+# Your job: monitor, not intervene
+watch -n 30 'curl -s "https://admin.internal/admin/sagas/stuck?hours=1" | jq length'
+
+# If stuck count is increasing: escalate
+# If stuck count is stable: wait for inventory recovery
+```
+
+**Do NOT manually compensate while dependency is down.**
+The saga will retry automatically. Manual intervention on
+a live dependency could double-compensate.
+
+## Step 3B: Dependency Slow — Adjust Timeout
+
+```bash
+# Force-open the circuit to stop accumulating failures
+curl -X POST https://admin.internal/admin/control/circuit/inventory-service/open \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "inventory service responding slowly, preventing accumulation"}'
+
+# Monitor: does error rate stabilize?
+# After 5 minutes: reset circuit to let it probe
+curl -X POST https://admin.internal/admin/control/circuit/inventory-service/reset
+```
+
+## Step 3C: Logic Bug — Disable Flag and Escalate
+
+```bash
+# Stop new orders from entering saga state
+curl -X POST https://admin.internal/admin/control/flags/ORDER_SAGA_ENABLED/disable \
+  -H "Content-Type: application/json" \
+  -d '{"reason": "compensation logic bug causing stuck sagas, stopping new entries"}'
+
+# Escalate immediately — do not attempt manual compensation without understanding the bug
+# The flag disables new entries but does not fix existing stuck sagas
+```
+
+## Step 3D: Recent Deploy — Rollback
+
+```bash
+# One command rollback — no approval needed for P1 incidents
+kubectl argo rollouts undo order-saga-service
+
+# Verify rollback completing:
+kubectl argo rollouts status order-saga-service
+
+# After rollback: do stuck sagas start processing?
+watch -n 30 'curl -s "https://admin.internal/admin/sagas/stuck?hours=1" | jq length'
+```
+
+## Step 4: Manual Compensation (Only If Needed)
+
+Use only when: automatic retry has failed 5+ times AND dependency is healthy.
+
+```bash
+# Claim the saga — prevents other engineers working on same
+curl -X POST https://admin.internal/admin/sagas/{SAGA_ID}/claim
+
+# Review the saga state before acting
+curl -s https://admin.internal/admin/sagas/{SAGA_ID} | jq .
+
+# Retry compensation (idempotent — safe to retry)
+curl -X POST https://admin.internal/admin/sagas/{SAGA_ID}/retry
+
+# If retry fails: abandon (requires reason, creates audit record)
+curl -X POST https://admin.internal/admin/sagas/{SAGA_ID}/abandon \
+  -d '{"reason": "inventory item no longer exists, manual refund issued"}'
+```
+
+**For bulk compensation (>10 sagas):**
+```bash
+# Dry run first — see what would be compensated
+curl -s "https://admin.internal/admin/sagas/bulk-retry?hours=4&dry_run=true" | jq .
+
+# Execute bulk retry
+curl -X POST "https://admin.internal/admin/sagas/bulk-retry?hours=4" \
+  -d '{"reason": "bulk compensation after inventory service recovery"}'
+
+# Monitor progress
+watch -n 15 'curl -s "https://admin.internal/admin/sagas/stuck?hours=1" | jq length'
+```
+
+## Step 5: Post-Incident (Before Going Back to Sleep)
+
+```bash
+# Document what happened in the audit log query
+curl -s "https://admin.internal/admin/audit?from=2024-01-15T02:00:00Z&to=2024-01-15T04:00:00Z" \
+  | jq . > incident-timeline.json
+
+# File incident ticket with:
+# - stuck count at peak
+# - root cause (circuit breaker? deploy? logic bug?)
+# - actions taken (from audit log)
+# - time to resolution
+# - what alert would have caught it earlier
+```
+
+## Re-enable Disabled Features
+
+```bash
+# If you disabled ORDER_SAGA_ENABLED: re-enable after fix is confirmed
+curl -X POST https://admin.internal/admin/control/flags/ORDER_SAGA_ENABLED/enable
+```
+
+## Escalation Path
+- P3 (< 10 stuck sagas): handle solo, file ticket by morning
+- P2 (10-100 stuck, auto-retrying): wake primary on-call
+- P1 (> 100 stuck, not recovering): wake primary + platform lead
+- P0 (orders failing for customers): wake primary + platform lead + engineering manager
+```
+
+---
+
+### Layer 5: The Kill Switch — Stop The Bleeding
+
+The kill switch is the most important operability tool. When something is wrong and you don't know what, stopping new work from entering the broken state is always the right first move.
+
+```java
+// Every critical flow has a kill switch
+@Service
+public class OrderFlowService {
+    
+    @Autowired private FeatureFlagService flags;
+    @Autowired private OrderQueue orderQueue;
+    
+    public OrderResult placeOrder(OrderRequest request) {
+        
+        // Kill switch — checked before any work begins
+        if (!flags.isEnabled("ORDER_SAGA_ENABLED")) {
+            
+            // Option A: queue for later processing (graceful degradation)
+            String queueId = orderQueue.enqueue(request);
+            
+            throw new ServiceDegradedException(
+                "Order processing temporarily unavailable. " +
+                "Your order has been queued (ref: " + queueId + ") " +
+                "and will process automatically when service resumes.",
+                queueId
+            );
+        }
+        
+        return saga.execute(request);
+    }
+}
+
+// The flag itself — with operational metadata
+@Entity
+public class FeatureFlag {
+    private String name;
+    private boolean enabled;
+    private String updatedBy;
+    private Instant updatedAt;
+    private String disableReason;
+    private Instant disabledUntil; // auto-re-enable at this time
+    
+    // Auto-re-enable prevents flags being forgotten in disabled state
+    // Operator sets: "disable for 30 minutes while we investigate"
+    // System re-enables automatically
+    // Prevents post-incident cleanup failure
+}
+
+// Scheduled job — re-enable expired flags
+@Scheduled(fixedRate = 60000)
+public void reEnableExpiredFlags() {
+    List<FeatureFlag> expired = flagRepo.findDisabledWithExpiredTimeout(Instant.now());
+    
+    for (FeatureFlag flag : expired) {
+        flag.setEnabled(true);
+        flagRepo.save(flag);
+        
+        log.info("Feature flag auto-re-enabled",
+            "flag", flag.getName(),
+            "disabledBy", flag.getUpdatedBy(),
+            "disabledReason", flag.getDisableReason()
+        );
+    }
+}
+```
+
+```go
+// Go — kill switch integrated into handler chain
+type KillSwitch struct {
+    flags  *FeatureFlagStore
+    queuer OrderQueuer
+}
+
+func (k *KillSwitch) Middleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        
+        // Check kill switch before any processing
+        flag, err := k.flags.Get(r.Context(), "ORDER_SAGA_ENABLED")
+        if err != nil || !flag.Enabled {
+            
+            // Queue the request — don't just reject
+            queueID, queueErr := k.queuer.Enqueue(r.Context(), r)
+            if queueErr != nil {
+                http.Error(w, "service temporarily unavailable", 
+                    http.StatusServiceUnavailable)
+                return
+            }
+            
+            w.WriteHeader(http.StatusAccepted)
+            json.NewEncoder(w).Encode(map[string]string{
+                "status":   "queued",
+                "queue_id": queueID,
+                "message":  "order will process when service resumes",
+            })
+            return
+        }
+        
+        next.ServeHTTP(w, r)
+    })
+}
+```
+
+---
+
+### Layer 6: Rollback Speed — Measured, Not Estimated
+
+Rollback is only useful if it's fast enough. Fast means under 5 minutes. If rollback takes longer, the incident has already escalated.
+
+```yaml
+# Deployment that supports 30-second rollback
+# argocd / argo rollouts configuration
+
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: order-service
+spec:
+  replicas: 10
+  
+  strategy:
+    canary:
+      canaryService: order-service-canary
+      stableService: order-service-stable
+      
+      steps:
+      - setWeight: 10      # 10% of traffic to new version
+      - pause: {duration: 5m}
+      - analysis:          # automated validation before proceeding
+          templates:
+          - templateName: order-error-rate
+          - templateName: order-p99-latency
+      - setWeight: 50
+      - pause: {duration: 10m}
+      - setWeight: 100
+      
+      autoPromotionEnabled: false  # human must approve final promotion
+      
+  # Automatic rollback if analysis fails
+  analysis:
+    successCondition: "result[0] < 0.01"  # < 1% error rate
+    failureCondition: "result[0] >= 0.05" # >= 5% = rollback immediately
+
+---
+# Rollback: one command, 30 seconds
+# $ kubectl argo rollouts undo order-service
+# 
+# What this does:
+# - Shifts 100% traffic back to previous version immediately
+# - No new image build
+# - No approval required (for rollback)
+# - Previous version already running (canary kept it warm)
+```
+
+**For teams without Kubernetes:**
+
+```bash
+# Blue-Green with load balancer swap (AWS ALB example)
+# Also one command, under 60 seconds
+
+# Current state:
+# ALB forwards 100% traffic to blue target group (current version)
+# Green target group running (previous version, kept warm)
+
+# Rollback command:
+aws elbv2 modify-listener \
+  --listener-arn $LISTENER_ARN \
+  --default-actions Type=forward,TargetGroupArn=$GREEN_TARGET_GROUP_ARN
+
+# Traffic now: 100% to green (previous version)
+# Time: ~30 seconds for DNS propagation + target group health check
+# Undo: same command with $BLUE_TARGET_GROUP_ARN
+```
+
+---
+
+## The Operability Self-Audit
+
+Apply this to any system you build or inherit. Before shipping, answer each:
+
+```
+□ VISIBILITY
+  Can an operator understand the system's current state 
+  in under 2 minutes without reading logs?
+  
+  If no: Add /admin/system/state endpoint.
+         If not possible: the system is not operable.
+
+□ CONTROL
+  Can an operator change the system's behavior 
+  without deploying new code?
+  
+  If no: Add feature flags for every critical flow.
+         Add runtime-configurable limits (pool size, rate limits).
+         Add circuit breaker manual override.
+
+□ REPAIR
+  Can an operator repair stuck or inconsistent state 
+  without writing new code?
+  
+  If no: Add admin endpoints for state mutation.
+         Add idempotent retry for every async operation.
+         Add audit trail for every manual intervention.
+
+□ ROLLBACK
+  Can an operator reverse the last deployment 
+  in under 5 minutes?
+  
+  If no: Fix the deployment pipeline before shipping.
+         A system without fast rollback is not safe to deploy.
+
+□ DOCUMENTATION
+  Does a runbook exist for every alert that can fire?
+  Does every runbook end with a decision, not a description?
+  
+  If no: Write runbooks before writing more features.
+         An undocumented alert wakes someone up at 3am 
+         with no guidance. That is a system design failure.
+
+□ AUDIT
+  After any incident, can you reconstruct 
+  who did what to the system and in what order?
+  
+  If no: Add audit logging for all admin actions.
+         Without this: the postmortem cannot determine 
+         whether humans made things better or worse.
+```
+
+---
+
+## The Complete 10-Invariant Map — Final
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    OPERABILITY (Meta-Invariant)                     │
+│  "If humans cannot understand, diagnose, and safely change the      │
+│   system under pressure — all other invariants fail at 3am"         │
+│                                                                     │
+│  Visibility  Control  Repair  Rollback  Documentation  Audit        │
+└─────────────────────────────────────────────────────────────────────┘
+                               │
+         ┌─────────────────────┼─────────────────────┐
+         │                     │                     │
+         ▼                     ▼                     ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│   RUNTIME       │  │   TEMPORAL      │  │   ECONOMIC      │
+│   INVARIANTS    │  │   INVARIANTS    │  │   INVARIANTS    │
+├─────────────────┤  ├─────────────────┤  ├─────────────────┤
+│ Flow            │  │ Change          │  │ Economics       │
+│ Consistency     │  │ Dependency      │  │                 │
+│ Capacity        │  │                 │  │                 │
+│ Latency         │  │                 │  │                 │
+│ Trust           │  │                 │  │                 │
+│ Observability   │  │                 │  │                 │
+└─────────────────┘  └─────────────────┘  └─────────────────┘
+
+Runtime:  properties the system must maintain while running
+Temporal: properties the system must maintain across time
+Economic: the meta-reasoning that governs all technical decisions
+Operability: the meta-invariant that makes all others survivable
+```
+
+---
+
+## The Economic Dimension — Why This Is The Senior Filter
+
+```
+Mid: "We'll add admin endpoints in v2 after launch."
+
+Senior: "There is no v2. There is only production.
+         The first incident happens before v2 ships.
+         
+         The operability layer costs:
+         - Admin endpoints: 3 days
+         - Runbooks: 1 day per critical flow
+         - Audit logging: 1 day
+         - Kill switches: 1 day
+         - Rollback pipeline: 3 days
+         Total: ~10 days of engineering
+         
+         The first incident without operability costs:
+         - Engineer time: 6+ hours × 2-3 engineers
+         - Customer impact: quantifiable by order value × count
+         - Postmortem: 1 day
+         - Fixing the gap after incident: 10 days anyway
+         Total: 10 days + incident damage
+         
+         The operability investment is not optional.
+         You pay it before the incident or after it.
+         After costs more.
+         
+         The real question isn't whether to build it.
+         It's whether to build it before or after 
+         the incident that makes it unavoidable."
+```
+
+That's the complete 10th invariant. The systems you build going forward should answer the operability self-audit before they ship — not after the first 3am page makes the gaps visible.
+
+
 
