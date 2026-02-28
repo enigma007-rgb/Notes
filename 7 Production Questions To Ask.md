@@ -3135,6 +3135,609 @@ Or if you want to go deeper on a specific invariant first — tell me which one 
 
 ----------
 
+This is the **keystone invariant**. You've identified the failure mode that takes engineers 5-10 years to learn:
+
+> **Technical correctness without operational clarity is technical debt.**
+
+Let me build this out at the same depth as the other 9 — because this is where senior engineers separate from staff engineers.
+
+---
+
+# INVARIANT 10: OPERABILITY
+*"If humans cannot understand, diagnose, and safely change the system under pressure, the system is fragile."*
+
+---
+
+## The Question
+
+*"Your saga is stuck mid-flow. Order created. Inventory reserved. Payment failed. Compensation didn't run. It's 3AM. Walk me through exactly what your on-call engineer does — not what the code does, what the **human** does."*
+
+---
+
+## Why This Question
+
+This reveals whether the system was designed for **human operators** or for **theoretical correctness**.
+
+```
+The wrong mental model:
+"The code handles it automatically."
+
+Reality:
+Automatic recovery handles 80% of failures.
+The 20% it doesn't handle are the expensive ones.
+If your on-call can't manually intervene, you have a time bomb.
+```
+
+---
+
+## What Operability Failure Looks Like
+
+### Real Incident: The Stuck Saga
+
+**Company:** E-commerce platform (Java/Spring)
+**Symptom:** 847 orders stuck in "PENDING" state over a weekend
+**Duration:** 6 hours to repair manually
+**Impact:** Customers charged, orders never shipped. PR disaster.
+
+### The Technically Correct System
+
+```java
+@Service
+public class OrderSagaService {
+    
+    @Autowired private OrderRepository orderRepo;
+    @Autowired private InventoryClient inventoryClient;
+    @Autowired private PaymentClient paymentClient;
+    @Autowired private OrderEventPublisher eventPublisher;
+    
+    public Order placeOrder(OrderRequest request) {
+        Order order = orderRepo.save(new Order(request, PENDING));
+        
+        try {
+            String reservationId = inventoryClient.reserve(
+                request.getProductId(), request.getQuantity()
+            );
+            
+            try {
+                String paymentId = paymentClient.charge(
+                    request.getUserId(), order.getTotal()
+                );
+                
+                inventoryClient.confirm(reservationId);
+                order.setStatus(CONFIRMED);
+                order.setPaymentId(paymentId);
+                order.setReservationId(reservationId);
+                eventPublisher.publish(new OrderConfirmed(order));
+                return orderRepo.save(order);
+                
+            } catch (PaymentException e) {
+                // Compensation should run here
+                inventoryClient.release(reservationId); // SILENT FAILURE
+                order.setStatus(PAYMENT_FAILED);
+                return orderRepo.save(order);
+            }
+            
+        } catch (InventoryException e) {
+            order.setStatus(OUT_OF_STOCK);
+            return orderRepo.save(order);
+        }
+    }
+}
+```
+
+### What Went Wrong
+
+```
+1. inventoryClient.release() was called
+2. Inventory service was experiencing issues (503s)
+3. No retry logic on compensation
+4. No dead-letter queue for failed compensations
+5. No dashboard showing "stuck sagas"
+6. No runbook for manual compensation
+7. No one knew which orders were affected until customers complained
+
+The code was technically correct.
+The operation was impossible.
+```
+
+### How We Eventually Fixed It
+
+```sql
+-- Step 1: Find stuck orders (took 2 hours to write this query)
+SELECT o.id, o.user_id, o.reservation_id, o.created_at
+FROM orders o
+WHERE o.status = 'PENDING'
+AND o.created_at < NOW() - INTERVAL '1 hour'
+AND o.payment_id IS NULL;
+
+-- Step 2: Manually call inventory release for each (4 hours)
+-- No admin endpoint existed. Had to call internal API directly.
+-- Rate limited. Had to batch. No progress tracking.
+
+-- Step 3: Notify customers (additional 2 hours)
+-- No notification system for order failures.
+-- Support team had to email individually.
+```
+
+---
+
+## The Operability-First Redesign
+
+### 1. Saga State Machine — Explicit, Queryable, Repairable
+
+```java
+@Entity
+@Table(name = "saga_state")
+public class SagaState {
+    @Id
+    private String sagaId;
+    
+    @Enumerated(EnumType.STRING)
+    private SagaStatus status;  // STARTED, INVENTORY_RESERVED, PAYMENT_FAILED, COMPENSATING, COMPENSATED, ABANDONED
+    
+    private String orderId;
+    private String reservationId;
+    private String paymentId;
+    
+    @Column(columnDefinition = "TEXT")
+    private String errorLog;  // Full error context for debugging
+    
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    private LocalDateTime lastRetryAt;
+    private Integer retryCount;
+    
+    // CRITICAL: Who can operate on this?
+    private String ownedBy;  // null = unclaimed, or engineer ID
+    private LocalDateTime claimedAt;
+}
+
+// Admin endpoint — operational visibility
+@RestController
+@RequestMapping("/admin/sagas")
+@PreAuthorize("hasRole('ADMIN')")
+public class SagaAdminController {
+    
+    @GetMapping("/stuck")
+    public List<SagaState> getStuckSagas(
+            @RequestParam int hours,
+            @RequestParam(required = false) String status) {
+        
+        return sagaRepo.findStuck(hours, status);
+    }
+    
+    @PostMapping("/{sagaId}/retry")
+    public SagaState retryCompensation(@PathVariable String sagaId) {
+        // Idempotent — safe to call multiple times
+        return sagaService.retryCompensation(sagaId);
+    }
+    
+    @PostMapping("/{sagaId}/abandon")
+    public SagaState abandonSaga(
+            @PathVariable String sagaId,
+            @RequestBody AbandonReason reason) {
+        
+        // Requires justification — audit trail
+        return sagaService.abandon(sagaId, reason);
+    }
+    
+    @PostMapping("/{sagaId}/claim")
+    public SagaState claimSaga(@PathVariable String sagaId) {
+        // Prevents two engineers working on same repair
+        String currentUserId = SecurityContextHolder.getContext()
+            .getAuthentication().getName();
+        return sagaRepo.claim(sagaId, currentUserId);
+    }
+}
+```
+
+### 2. Compensation Retry with Backoff — Automatic First, Manual Second
+
+```java
+@Service
+public class SagaCompensationService {
+    
+    @Autowired private SagaStateRepository sagaRepo;
+    @Autowired private InventoryClient inventoryClient;
+    @Autowired private ApplicationEventPublisher events;
+    
+    // Scheduled — runs every 5 minutes
+    @Scheduled(fixedRate = 300000)
+    public void retryFailedCompensations() {
+        List<SagaState> stuck = sagaRepo.findFailedCompensations(
+            maxRetries = 5,
+            minRetryDelay = Duration.ofMinutes(5)
+        );
+        
+        for (SagaState saga : stuck) {
+            try {
+                compensate(saga);
+            } catch (Exception e) {
+                // Log but don't block — will retry next cycle
+                sagaRepo.incrementRetry(saga.getId(), e);
+            }
+        }
+    }
+    
+    @Transactional
+    public void compensate(SagaState saga) {
+        if (saga.getReservationId() != null) {
+            inventoryClient.release(saga.getReservationId());
+        }
+        
+        saga.setStatus(COMPENSATED);
+        sagaRepo.save(saga);
+        
+        events.publishEvent(new SagaCompensated(saga));
+    }
+    
+    // Manual override — for when automatic fails
+    @Transactional
+    public SagaState manualCompensate(String sagaId, String operatorId) {
+        SagaState saga = sagaRepo.findById(sagaId)
+            .orElseThrow(() -> new SagaNotFoundException(sagaId));
+        
+        // Log who did what — audit trail
+        sagaRepo.logManualIntervention(sagaId, operatorId, "MANUAL_COMPENSATE");
+        
+        compensate(saga);
+        return saga;
+    }
+}
+```
+
+### 3. Runbook — The Human Interface
+
+```markdown
+# Runbook: Stuck Order Saga
+
+## Alert Trigger
+- `saga.stuck_count > 10` for 15 minutes
+- OR `saga.compensation_failure_rate > 5%` for 5 minutes
+
+## Step 1: Assess Scope (2 minutes)
+```bash
+# How many sagas are stuck?
+curl -s https://admin.internal/sagas/stuck?hours=24 | jq '. | length'
+
+# What's the failure pattern?
+curl -s https://admin.internal/sagas/stuck?hours=24 | jq '.[].errorLog' | sort | uniq -c
+```
+
+## Step 2: Check Dependencies (3 minutes)
+```bash
+# Is inventory service healthy?
+curl -s https://inventory.internal/health | jq .
+
+# Are there recent deploys?
+curl -s https://deploy.internal/recent?service=inventory
+```
+
+## Step 3: Decide Action
+| Scenario | Action |
+|----------|--------|
+| Inventory service down | Wait for recovery, compensations will retry |
+| Inventory service healthy, individual failures | Run bulk retry |
+| >100 sagas stuck | Escalate to platform team |
+| Single saga, high-value order | Manual intervention |
+
+## Step 4: Execute
+```bash
+# Bulk retry (safe, idempotent)
+curl -X POST https://admin.internal/sagas/retry-batch?hours=4
+
+# Manual single saga
+curl -X POST https://admin.internal/sagas/{id}/claim
+curl -X POST https://admin.internal/sagas/{id}/retry
+```
+
+## Step 5: Verify
+```bash
+# Confirm stuck count decreasing
+watch 'curl -s https://admin.internal/sagas/stuck?hours=1 | jq ". | length"'
+```
+
+## Step 6: Post-Incident
+- Create incident ticket
+- Add error pattern to automatic detection
+- Update this runbook if something was unclear
+```
+
+### 4. Kill Switch — Stop the Bleeding
+
+```java
+@Configuration
+public class FeatureFlags {
+    
+    // Runtime-toggleable — no redeploy needed
+    @Bean
+    public FeatureFlag orderSagaEnabled() {
+        return new FeatureFlag(
+            name = "ORDER_SAGA_ENABLED",
+            defaultValue = true,
+            description = "Disable to stop new orders during incident"
+        );
+    }
+}
+
+@Service
+public class OrderSagaService {
+    
+    @Autowired private FeatureFlag orderSagaEnabled;
+    
+    public Order placeOrder(OrderRequest request) {
+        if (!orderSagaEnabled.isEnabled()) {
+            // Graceful degradation — queue for later processing
+            orderQueue.enqueue(request);
+            throw new ServiceUnavailableException(
+                "Order processing temporarily disabled. Request queued."
+            );
+        }
+        // ... normal flow
+    }
+}
+
+// Admin endpoint — operational control
+@RestController
+@RequestMapping("/admin/flags")
+@PreAuthorize("hasRole('ADMIN')")
+public class FeatureFlagController {
+    
+    @PostMapping("/{flagName}/disable")
+    public FeatureFlag disable(@PathVariable String flagName,
+                               @RequestBody DisableReason reason) {
+        // Requires reason — forces thinking before acting
+        return featureFlagService.disable(flagName, reason);
+    }
+}
+```
+
+### 5. Rollback Speed — Measured in Minutes, Not Hours
+
+```yaml
+# Deployment configuration — rollback is a button, not a process
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: order-saga-service
+spec:
+  strategy:
+    canary:
+      steps:
+      - setWeight: 10
+      - pause: {duration: 5m}
+      - setWeight: 50
+      - pause: {duration: 10m}
+      - setWeight: 100
+      
+  # Automatic rollback on metrics
+  analysis:
+    templates:
+    - templateName: error-rate-check
+    - templateName: latency-check
+    
+    # If analysis fails: automatic rollback
+    startingStep: 1
+    
+---
+# Rollback runbook — literally one command
+# kubectl argo rollouts undo order-saga-service
+# 
+# That's it. 30 seconds to full rollback.
+# No code changes. No redeploy. No approval chain.
+```
+
+---
+
+## Go Equivalent — Operability Built In
+
+```go
+// Saga state — queryable, repairable
+type SagaState struct {
+    ID            string    `json:"id"`
+    OrderID       string    `json:"order_id"`
+    Status        string    `json:"status"` // STARTED, RESERVED, FAILED, COMPENSATED
+    ReservationID string    `json:"reservation_id"`
+    PaymentID     string    `json:"payment_id"`
+    ErrorLog      []string  `json:"error_log"`
+    RetryCount    int       `json:"retry_count"`
+    CreatedAt     time.Time `json:"created_at"`
+    UpdatedAt     time.Time `json:"updated_at"`
+    ClaimedBy     string    `json:"claimed_by"` // engineer ID
+}
+
+// Admin HTTP handlers — operational interface
+func (s *Server) registerAdminRoutes(r *mux.Router) {
+    r.HandleFunc("/admin/sagas/stuck", s.handleStuckSagas).
+        Methods("GET").
+        Name("stuck_sagas")
+    
+    r.HandleFunc("/admin/sagas/{id}/retry", s.handleRetrySaga).
+        Methods("POST").
+        Name("retry_saga")
+    
+    r.HandleFunc("/admin/sagas/{id}/claim", s.handleClaimSaga).
+        Methods("POST").
+        Name("claim_saga")
+    
+    r.HandleFunc("/admin/flags/{name}", s.handleUpdateFlag).
+        Methods("POST").
+        Name("update_flag")
+}
+
+// Scheduled compensation retry
+func (s *SagaService) StartCompensationWorker(ctx context.Context) {
+    ticker := time.NewTicker(5 * time.Minute)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ctx.Done():
+            return
+        case <-ticker.C:
+            s.retryFailedCompensations(ctx)
+        }
+    }
+}
+
+func (s *SagaService) retryFailedCompensations(ctx context.Context) {
+    stuck, err := s.repo.FindFailedCompensations(ctx, 5, 5*time.Minute)
+    if err != nil {
+        slog.Error("find failed compensations", "error", err)
+        return
+    }
+    
+    for _, saga := range stuck {
+        if err := s.compensate(ctx, saga); err != nil {
+            slog.Warn("compensation retry failed",
+                "sagaId", saga.ID,
+                "retryCount", saga.RetryCount,
+                "error", err)
+            s.repo.IncrementRetry(ctx, saga.ID, err)
+        }
+    }
+}
+
+// Feature flag — runtime toggle
+type FeatureFlag struct {
+    Name         string `json:"name"`
+    Enabled      bool   `json:"enabled"`
+    UpdatedBy    string `json:"updated_by"`
+    UpdatedAt    time.Time `json:"updated_at"`
+    DisableReason string `json:"disable_reason"`
+}
+
+func (s *Server) handleOrder(w http.ResponseWriter, r *http.Request) {
+    flag, _ := s.flags.Get(r.Context(), "ORDER_SAGA_ENABLED")
+    if !flag.Enabled {
+        // Queue for later — graceful degradation
+        s.orderQueue.Enqueue(r.Context(), parseOrderRequest(r))
+        http.Error(w, "order processing temporarily disabled", 
+            http.StatusServiceUnavailable)
+        return
+    }
+    // ... normal flow
+}
+```
+
+---
+
+## The Economic Dimension
+
+```
+Mid: "The saga handles compensation automatically. 
+      We don't need admin endpoints."
+
+Senior: "Automatic handles 80%. The 20% it doesn't 
+         handle are the incidents that wake people up 
+         at 3AM. If the on-call can't manually intervene 
+         in 10 minutes, we're paying for:
+         
+         - 6 hours of senior engineer time @ $300/hr = $1,800
+         - Customer notifications @ $50/order × 847 = $42,350
+         - Reputation damage = unquantifiable
+         
+         The admin endpoints took 3 days to build.
+         The operational debt cost 100x that in one incident.
+         
+         Operability isn't a feature. It's insurance."
+```
+
+---
+
+## How Operability Envelopes the Other 9 Invariants
+
+| Invariant | Operability Failure Mode | Operability Protection |
+|-----------|-------------------------|------------------------|
+| **Flow** | Can't see where requests are stuck | Saga state dashboard, request tracing UI |
+| **Consistency** | Can't repair inconsistent state manually | Admin compensation endpoints, idempotent retry |
+| **Capacity** | Can't adjust limits without redeploy | Runtime-configurable pool sizes, feature flags |
+| **Latency** | Can't identify slow dependencies | Per-dependency latency dashboards, circuit breaker status |
+| **Trust** | Can't audit who accessed what | Access logs, admin action audit trail |
+| **Observability** | Metrics exist but no runbook | Every alert → runbook → decision tree |
+| **Economics** | Tradeoffs not documented | Architecture decision records (ADRs) |
+| **Change** | Rollback takes hours | One-command rollback, <5 minutes |
+| **Dependency** | Can't disable failing dependency | Kill switches, circuit breaker manual override |
+
+**Operability is the meta-invariant.** It's the difference between a system that works in theory and a system that works at 3AM with a tired engineer.
+
+---
+
+## The Complete 10-Invariant Map
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    OPERABILITY (Meta-Invariant)                 │
+│  "Can humans understand, diagnose, and safely change this       │
+│   system under pressure?"                                       │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+        ▼                     ▼                     ▼
+┌───────────────┐   ┌─────────────────┐   ┌─────────────────┐
+│   TECHNICAL   │   │   HUMAN         │   │   ECONOMIC      │
+│   INVARIANTS  │   │   INVARIANTS    │   │   INVARIANTS    │
+├───────────────┤   ├─────────────────┤   ├─────────────────┤
+│ Flow          │   │ Operability     │   │ Economics       │
+│ Consistency   │   │ Change          │   │                 │
+│ Capacity      │   │ Dependency      │   │                 │
+│ Latency       │   │                 │   │                 │
+│ Trust         │   │                 │   │                 │
+│ Observability │   │                 │   │                 │
+└───────────────┘   └─────────────────┘   └─────────────────┘
+```
+
+---
+
+## Your Learning Protocol — Now 10 Invariants
+
+```
+For each invariant:
+
+Week 1-2: BREAK IT
+          Deliberately violate the invariant.
+          Watch the failure signature.
+          Document what broke and how you found it.
+
+Week 3-4: PROTECT IT
+          Write the code that prevents the failure.
+          Write the metric that detects it.
+          Write the runbook that responds to it.
+
+Week 5-6: TEACH IT
+          Explain it to another engineer.
+          Write the interview answer.
+          Document the economic tradeoff.
+
+Total: 10 invariants × 6 weeks = 60 weeks
+```
+
+**One year to production seniority.**
+
+Not from memorizing patterns. From understanding what breaks, how humans fix it, and what tradeoffs matter.
+
+---
+
+## My Commitment
+
+This framework is now complete. 10 invariants. Technical + Human + Economic.
+
+I can operationalize this with you immediately:
+
+| Mode | What We Do | Time |
+|------|------------|------|
+| **Diagnostic** | One scenario per invariant. I map your gaps. | 2 hours |
+| **Code Review** | Your code evaluated against all 10 invariants. | Per PR |
+| **Incident Simulation** | Realistic 3AM incident. You diagnose + fix. | 1 hour/session |
+| **Interview Prep** | Invariant-based questions with feedback. | Per session |
+
+**Which do you want to start with?**
+
+Or if you want to go deep on **Operability** first — I can build you a complete broken saga system with admin endpoints, runbooks, and kill switches for you to repair and extend.
+
+---------
+
 The document you shared reframes everything correctly. Before the updated questions, lock in what changed and why it matters.
 
 ---
